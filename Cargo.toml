@@ -1,0 +1,20 @@
+[package]
+name = "biboop"
+version = "0.1.0"
+authors = ["Daniel Brain <daniel.brain@biboop.com>"]
+edition = "2018"
+
+[dependencies]
+evmap = "10.0"
+actix = "0.9"
+actix-web = "2.0"
+actix-rt = "1.1"
+serde = "1.0"
+serde_json = "1.0"
+anyhow = "1.0"
+rand = "0.7"
+chrono = { version = "0.4", default-features = true, features = [ "serde" ] }
+env_logger = "0.7"
+log = "0.4"
+dotenv = "0.15"
+clokwerk = "0.3"

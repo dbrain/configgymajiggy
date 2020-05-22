@@ -1,0 +1,12 @@
+[Unit]
+Description=Biboop
+
+[Service]
+User=biboop
+Group=biboop
+Environment=RUST_LOG=info
+Type=simple
+ExecStart=/usr/local/bin/biboop-amd64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,4 +1,4 @@
-use actix_web::{http::StatusCode, post, put, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{get, http::StatusCode, post, put, web, App, HttpResponse, HttpServer, Responder};
 use chrono::prelude::{DateTime, Utc};
 use chrono::Duration;
 use clokwerk::{Scheduler, TimeUnits};
@@ -110,12 +110,12 @@ fn get_and_remove_pin_if_populated(
     })
 }
 
-#[post("/{namespace}/pin")]
+#[post("/pin/{namespace}")]
 async fn get_pin(path: web::Path<(String,)>, data: web::Data<BiboopState>) -> impl Responder {
     create_pin_http_response(&path.0, data.get_ref())
 }
 
-#[post("/{namespace}/pin/{pin}")]
+#[post("/pin/{namespace}/{pin}")]
 async fn poll_pin(
     path: web::Path<(String, String)>,
     data: web::Data<BiboopState>,
@@ -127,7 +127,7 @@ async fn poll_pin(
     }
 }
 
-#[put("/{namespace}/pin/{pin}")]
+#[put("/pin/{namespace}/{pin}")]
 async fn respond_to_pin(
     path: web::Path<(String, String)>,
     data: web::Data<BiboopState>,
@@ -155,10 +155,16 @@ async fn respond_to_pin(
     }
 }
 
+#[get("/health")]
+async fn health() -> impl Responder {
+    HttpResponse::Ok().body("All good.")
+}
+
 fn setup_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(get_pin);
     cfg.service(poll_pin);
     cfg.service(respond_to_pin);
+    cfg.service(health);
 }
 
 #[actix_rt::main]

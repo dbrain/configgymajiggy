@@ -6,20 +6,19 @@ edition = "2021"
 
 [dependencies]
 evmap = "10.0"
-axum = "0.7"
+axum = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
-rand = "0.8"
-chrono = { version = "0.4", default-features = true, features = ["serde"] }
+rand = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
 env_logger = "0.11"
 log = "0.4"
-dotenv = "0.15"
+dotenvy = "0.15"
 clokwerk = "0.4"
-tokio = { version = "1.0", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "net", "macros", "signal"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
-axum-test = "15.0"
-tower = { version = "0.4", features = ["util"] }
+axum-test = "17.0"

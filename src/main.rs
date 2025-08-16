@@ -9,8 +9,8 @@ use chrono::prelude::{DateTime, Utc};
 use chrono::Duration;
 use clokwerk::{Scheduler, TimeUnits};
 use log::info;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::distr::Alphanumeric;
+use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -65,7 +65,7 @@ impl PinItem {
 
 fn create_unique_pin(namespace: &str, state: &BiboopState) -> Option<String> {
     for _ in 0..10 {
-        let pin: String = thread_rng()
+        let pin: String = rng()
             .sample_iter(&Alphanumeric)
             .take(PIN_LENGTH)
             .map(char::from)
@@ -173,15 +173,15 @@ async fn health() -> impl IntoResponse {
 fn create_router() -> Router<BiboopState> {
     Router::new()
         .route("/health", get(health))
-        .route("/pin/:namespace", post(get_pin))
-        .route("/pin/:namespace/:pin", post(poll_pin))
-        .route("/pin/:namespace/:pin", put(respond_to_pin))
+        .route("/pin/{namespace}", post(get_pin))
+        .route("/pin/{namespace}/{pin}", post(poll_pin))
+        .route("/pin/{namespace}/{pin}", put(respond_to_pin))
         .layer(CorsLayer::permissive())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     env_logger::init();
 
     let (read, write) = evmap::new();

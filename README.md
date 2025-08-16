@@ -288,13 +288,14 @@ cargo test test_health_endpoint
 
 Key dependencies and their purposes:
 
-- `axum`: Modern HTTP server framework built on hyper and tower
-- `evmap`: Lock-free concurrent map for high-performance storage
-- `serde`: JSON serialization/deserialization
-- `chrono`: Date/time handling for expiry
-- `clokwerk`: Background task scheduling
-- `rand`: PIN generation
-- `tower-http`: HTTP middleware and utilities
+- `axum`: Modern HTTP server framework built on hyper and tower (v0.8)
+- `evmap`: Lock-free concurrent map for high-performance storage (v10.0)
+- `serde`: JSON serialization/deserialization (v1.0)
+- `chrono`: Date/time handling for expiry (v0.4)
+- `clokwerk`: Background task scheduling (v0.4)
+- `rand`: PIN generation (v0.9 with updated API)
+- `tower-http`: HTTP middleware and utilities (v0.6)
+- `dotenvy`: Environment variable loading (modern dotenv replacement)
 
 ## Production Deployment
 
@@ -343,9 +344,10 @@ sudo journalctl -u biboop -f
 
 ## Recent Improvements
 
-✅ **Framework Migration**: Migrated from Actix-web to Axum 0.7 for better performance  
-✅ **Modern Architecture**: Built on hyper and tower for optimal async performance  
-✅ **Type Safety**: Compile-time route validation and improved error handling  
+✅ **Latest Framework**: Migrated to Axum 0.8 with modern path parameter syntax (`{param}`)  
+✅ **Dependency Updates**: All dependencies updated to latest versions (rand 0.9, tower 0.5, etc.)  
+✅ **Modern Environment**: Replaced dotenv with dotenvy for better maintenance  
+✅ **Optimized Features**: Refined tokio features for smaller binary size  
 ✅ **All Tests Passing**: 14 comprehensive tests covering unit and integration scenarios  
 ✅ **Rust 2021**: Updated to latest Rust edition with modern async patterns
 

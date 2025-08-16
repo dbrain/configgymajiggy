@@ -2,11 +2,11 @@
 name = "biboop"
 version = "0.1.0"
 authors = ["Daniel Brain <daniel.brain@biboop.com>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 evmap = "10.0"
-actix-web = "4.8"
+axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -17,7 +17,9 @@ log = "0.4"
 dotenv = "0.15"
 clokwerk = "0.4"
 tokio = { version = "1.0", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
 
 [dev-dependencies]
-actix-web = { version = "4.8", features = ["macros"] }
-tokio-test = "0.4"
+axum-test = "15.0"
+tower = { version = "0.4", features = ["util"] }

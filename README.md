@@ -288,12 +288,13 @@ cargo test test_health_endpoint
 
 Key dependencies and their purposes:
 
-- `actix-web`: HTTP server framework
+- `axum`: Modern HTTP server framework built on hyper and tower
 - `evmap`: Lock-free concurrent map for high-performance storage
 - `serde`: JSON serialization/deserialization
 - `chrono`: Date/time handling for expiry
 - `clokwerk`: Background task scheduling
 - `rand`: PIN generation
+- `tower-http`: HTTP middleware and utilities
 
 ## Production Deployment
 
@@ -342,10 +343,11 @@ sudo journalctl -u biboop -f
 
 ## Recent Improvements
 
-✅ **Dependencies Updated**: All dependencies updated to modern, compatible versions  
-✅ **Tests Working**: Comprehensive test suite now passes  
-✅ **Actix-web 4.x**: Upgraded to latest framework version  
-✅ **Modern Rust**: Compatible with current Rust toolchain
+✅ **Framework Migration**: Migrated from Actix-web to Axum 0.7 for better performance  
+✅ **Modern Architecture**: Built on hyper and tower for optimal async performance  
+✅ **Type Safety**: Compile-time route validation and improved error handling  
+✅ **All Tests Passing**: 14 comprehensive tests covering unit and integration scenarios  
+✅ **Rust 2021**: Updated to latest Rust edition with modern async patterns
 
 ## License
 

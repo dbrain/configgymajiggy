@@ -1,4 +1,10 @@
-use actix_web::{get, http::StatusCode, post, put, web, App, HttpResponse, HttpServer, Result};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Json},
+    routing::{get, post, put},
+    Router,
+};
 use chrono::prelude::{DateTime, Utc};
 use chrono::Duration;
 use clokwerk::{Scheduler, TimeUnits};
@@ -10,6 +16,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
+use tower_http::cors::CorsLayer;
 
 const PIN_LENGTH: usize = 4;
 const MAX_RESULT_SIZE_BYTES: usize = 3000;
@@ -20,6 +27,10 @@ struct BiboopState {
     read: evmap::ReadHandle<String, Box<PinItem>>,
     write: Arc<Mutex<evmap::WriteHandle<String, Box<PinItem>>>>,
 }
+
+// Need to implement Sync manually since evmap::ReadHandle contains Cell<()> 
+// which is not Sync, but in practice it's safe in our usage
+unsafe impl Sync for BiboopState {}
 
 #[derive(Serialize, Deserialize)]
 struct PinResponse {
@@ -81,12 +92,11 @@ fn create_new_pin_response(namespace: &str, state: &BiboopState) -> Option<PinRe
     })
 }
 
-fn create_pin_http_response(namespace: &str, state: &BiboopState) -> HttpResponse {
+fn create_pin_http_response(namespace: &str, state: &BiboopState) -> impl IntoResponse {
     let pin_response = create_new_pin_response(namespace, state);
     match pin_response {
-        Some(res) => HttpResponse::Ok().json(res),
-        _ => HttpResponse::build(StatusCode::TOO_MANY_REQUESTS)
-            .body("Could not find a free pin soon enough."),
+        Some(res) => Json(res).into_response(),
+        _ => (StatusCode::TOO_MANY_REQUESTS, "Could not find a free pin soon enough.").into_response(),
     }
 }
 
@@ -111,64 +121,62 @@ fn get_and_remove_pin_if_populated(
     })
 }
 
-#[post("/pin/{namespace}")]
-async fn get_pin(path: web::Path<(String,)>, data: web::Data<BiboopState>) -> Result<HttpResponse> {
-    Ok(create_pin_http_response(&path.0, data.get_ref()))
+async fn get_pin(
+    Path(namespace): Path<String>,
+    State(state): State<BiboopState>,
+) -> impl IntoResponse {
+    create_pin_http_response(&namespace, &state)
 }
 
-#[post("/pin/{namespace}/{pin}")]
 async fn poll_pin(
-    path: web::Path<(String, String)>,
-    data: web::Data<BiboopState>,
-) -> Result<HttpResponse> {
-    let state = data.get_ref();
-    Ok(match get_and_remove_pin_if_populated(&path.0, &path.1, state) {
-        Some(pin_item) => HttpResponse::Ok().json(pin_item),
-        _ => create_pin_http_response(&path.0, state),
-    })
+    Path((namespace, pin)): Path<(String, String)>,
+    State(state): State<BiboopState>,
+) -> impl IntoResponse {
+    match get_and_remove_pin_if_populated(&namespace, &pin, &state) {
+        Some(pin_item) => Json(pin_item).into_response(),
+        _ => create_pin_http_response(&namespace, &state).into_response(),
+    }
 }
 
-#[put("/pin/{namespace}/{pin}")]
 async fn respond_to_pin(
-    path: web::Path<(String, String)>,
-    data: web::Data<BiboopState>,
-    body: web::Json<HashMap<String, Value>>,
-) -> Result<HttpResponse> {
-    let result = body.0;
+    Path((namespace, pin)): Path<(String, String)>,
+    State(state): State<BiboopState>,
+    Json(result): Json<HashMap<String, Value>>,
+) -> impl IntoResponse {
     let serialized = match serde_json::to_string(&result) {
         Ok(s) => s,
-        Err(_) => return Ok(HttpResponse::InternalServerError().body("Failed to serialize data")),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize data").into_response(),
     };
     if serialized.len() > MAX_RESULT_SIZE_BYTES {
-        return Ok(HttpResponse::build(StatusCode::PAYLOAD_TOO_LARGE).body("Payload too large."));
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Payload too large.").into_response();
     }
 
-    let key = format!("{}:{}", path.0, path.1);
-    let state = data.get_ref();
+    let key = format!("{}:{}", namespace, pin);
     if state.read.contains_key(&key) {
         if let Ok(mut write_handle) = state.write.lock() {
             write_handle.update(
                 key,
-                Box::new(PinItem::new(path.1.to_string(), Some(result))),
+                Box::new(PinItem::new(pin.to_string(), Some(result))),
             );
             write_handle.refresh();
         }
-        Ok(HttpResponse::Accepted().body("Thanks!"))
+        (StatusCode::ACCEPTED, "Thanks!").into_response()
     } else {
-        Ok(HttpResponse::NotFound().body("Pin not found."))
+        (StatusCode::NOT_FOUND, "Pin not found.").into_response()
     }
 }
 
-#[get("/health")]
-async fn health() -> Result<HttpResponse> {
-    Ok(HttpResponse::Ok().body("All good."))
+async fn health() -> impl IntoResponse {
+    "All good."
 }
 
-fn setup_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(get_pin);
-    cfg.service(poll_pin);
-    cfg.service(respond_to_pin);
-    cfg.service(health);
+fn create_router() -> Router<BiboopState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/pin/:namespace", post(get_pin))
+        .route("/pin/:namespace/:pin", post(poll_pin))
+        .route("/pin/:namespace/:pin", put(respond_to_pin))
+        .layer(CorsLayer::permissive())
 }
 
 #[tokio::main]
@@ -209,10 +217,11 @@ async fn main() -> anyhow::Result<()> {
     });
     let _thread_handle = scheduler.watch_thread(std::time::Duration::from_millis(100));
 
-    HttpServer::new(move || App::new().app_data(web::Data::new(state.clone())).configure(setup_routes))
-        .bind("0.0.0.0:8080")?
-        .run()
-        .await?;
+    let app = create_router().with_state(state);
+    
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    info!("Server running on http://0.0.0.0:8080");
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
@@ -220,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{test, web, App};
+    use axum_test::TestServer;
     use serde_json::json;
 
     fn create_test_state() -> BiboopState {
@@ -352,38 +361,26 @@ mod tests {
     // Integration tests for HTTP endpoints
     #[tokio::test]
     async fn test_health_endpoint() {
-        let app = test::init_service(
-            App::new().configure(setup_routes)
-        ).await;
+        let state = create_test_state();
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
         
-        let req = test::TestRequest::get()
-            .uri("/health")
-            .to_request();
+        let response = server.get("/health").await;
         
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
-        
-        let body = test::read_body(resp).await;
-        assert_eq!(body, "All good.");
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.text(), "All good.");
     }
 
     #[tokio::test]
     async fn test_get_pin_endpoint() {
         let state = create_test_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(state))
-                .configure(setup_routes)
-        ).await;
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
         
-        let req = test::TestRequest::post()
-            .uri("/pin/testns")
-            .to_request();
+        let response = server.post("/pin/testns").await;
         
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
-        
-        let body: PinResponse = test::read_body_json(resp).await;
+        assert_eq!(response.status_code(), 200);
+        let body: PinResponse = response.json();
         assert_eq!(body.pin.len(), PIN_LENGTH);
         assert!(body.result.is_none());
     }
@@ -391,21 +388,14 @@ mod tests {
     #[tokio::test]
     async fn test_poll_pin_nonexistent() {
         let state = create_test_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(state))
-                .configure(setup_routes)
-        ).await;
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
         
-        let req = test::TestRequest::post()
-            .uri("/pin/testns/FAKE")
-            .to_request();
+        let response = server.post("/pin/testns/FAKE").await;
         
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
-        
+        assert_eq!(response.status_code(), 200);
         // Should return a new pin since the fake one doesn't exist
-        let body: PinResponse = test::read_body_json(resp).await;
+        let body: PinResponse = response.json();
         assert_eq!(body.pin.len(), PIN_LENGTH);
         assert!(body.result.is_none());
     }
@@ -413,44 +403,28 @@ mod tests {
     #[tokio::test]
     async fn test_respond_to_pin_nonexistent() {
         let state = create_test_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(state))
-                .configure(setup_routes)
-        ).await;
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
         
         let test_data = json!({"message": "test"});
         
-        let req = test::TestRequest::put()
-            .uri("/pin/testns/FAKE")
-            .set_json(&test_data)
-            .to_request();
+        let response = server.put("/pin/testns/FAKE").json(&test_data).await;
         
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 404);
-        
-        let body = test::read_body(resp).await;
-        assert_eq!(body, "Pin not found.");
+        assert_eq!(response.status_code(), 404);
+        assert_eq!(response.text(), "Pin not found.");
     }
 
     #[tokio::test]
     async fn test_full_pin_workflow() {
         let state = create_test_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(state))
-                .configure(setup_routes)
-        ).await;
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
         
         // Step 1: Create a new pin
-        let req = test::TestRequest::post()
-            .uri("/pin/workflow")
-            .to_request();
+        let response = server.post("/pin/workflow").await;
+        assert_eq!(response.status_code(), 200);
         
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
-        
-        let pin_response: PinResponse = test::read_body_json(resp).await;
+        let pin_response: PinResponse = response.json();
         let pin = pin_response.pin;
         assert!(pin_response.result.is_none());
         
@@ -461,26 +435,15 @@ mod tests {
             "array": [1, 2, 3]
         });
         
-        let req = test::TestRequest::put()
-            .uri(&format!("/pin/workflow/{}", pin))
-            .set_json(&test_data)
-            .to_request();
-        
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 202);
-        
-        let body = test::read_body(resp).await;
-        assert_eq!(body, "Thanks!");
+        let response = server.put(&format!("/pin/workflow/{}", pin)).json(&test_data).await;
+        assert_eq!(response.status_code(), 202);
+        assert_eq!(response.text(), "Thanks!");
         
         // Step 3: Poll the pin to get the data
-        let req = test::TestRequest::post()
-            .uri(&format!("/pin/workflow/{}", pin))
-            .to_request();
+        let response = server.post(&format!("/pin/workflow/{}", pin)).await;
+        assert_eq!(response.status_code(), 200);
         
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
-        
-        let poll_response: PinResponse = test::read_body_json(resp).await;
+        let poll_response: PinResponse = response.json();
         assert_eq!(poll_response.pin, pin);
         assert!(poll_response.result.is_some());
         
@@ -490,14 +453,10 @@ mod tests {
         assert_eq!(result.get("array").unwrap(), &json!([1, 2, 3]));
         
         // Step 4: Try to poll again - should return new pin since data was consumed
-        let req = test::TestRequest::post()
-            .uri(&format!("/pin/workflow/{}", pin))
-            .to_request();
+        let response = server.post(&format!("/pin/workflow/{}", pin)).await;
+        assert_eq!(response.status_code(), 200);
         
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
-        
-        let new_poll_response: PinResponse = test::read_body_json(resp).await;
+        let new_poll_response: PinResponse = response.json();
         assert_ne!(new_poll_response.pin, pin); // Should be a new pin
         assert!(new_poll_response.result.is_none());
     }
@@ -505,82 +464,51 @@ mod tests {
     #[tokio::test]
     async fn test_payload_too_large() {
         let state = create_test_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(state))
-                .configure(setup_routes)
-        ).await;
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
         
         // First create a pin
-        let req = test::TestRequest::post()
-            .uri("/pin/large")
-            .to_request();
-        
-        let resp = test::call_service(&app, req).await;
-        let pin_response: PinResponse = test::read_body_json(resp).await;
+        let response = server.post("/pin/large").await;
+        let pin_response: PinResponse = response.json();
         let pin = pin_response.pin;
         
         // Create a large payload (over 3KB)
         let large_string = "x".repeat(4000);
         let large_data = json!({"data": large_string});
         
-        let req = test::TestRequest::put()
-            .uri(&format!("/pin/large/{}", pin))
-            .set_json(&large_data)
-            .to_request();
-        
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 413);
-        
-        let body = test::read_body(resp).await;
-        assert_eq!(body, "Payload too large.");
+        let response = server.put(&format!("/pin/large/{}", pin)).json(&large_data).await;
+        assert_eq!(response.status_code(), 413);
+        assert_eq!(response.text(), "Payload too large.");
     }
 
     #[tokio::test]
     async fn test_namespace_isolation() {
         let state = create_test_state();
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(state))
-                .configure(setup_routes)
-        ).await;
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
         
         // Create pins in different namespaces
-        let req1 = test::TestRequest::post().uri("/pin/ns1").to_request();
-        let req2 = test::TestRequest::post().uri("/pin/ns2").to_request();
+        let resp1 = server.post("/pin/ns1").await;
+        let resp2 = server.post("/pin/ns2").await;
         
-        let resp1 = test::call_service(&app, req1).await;
-        let resp2 = test::call_service(&app, req2).await;
-        
-        let pin1: PinResponse = test::read_body_json(resp1).await;
-        let _pin2: PinResponse = test::read_body_json(resp2).await;
+        let pin1: PinResponse = resp1.json();
+        let _pin2: PinResponse = resp2.json();
         
         // Submit data to pin in ns1
         let data1 = json!({"namespace": "ns1"});
-        let req = test::TestRequest::put()
-            .uri(&format!("/pin/ns1/{}", pin1.pin))
-            .set_json(&data1)
-            .to_request();
-        test::call_service(&app, req).await;
+        server.put(&format!("/pin/ns1/{}", pin1.pin)).json(&data1).await;
         
         // Try to access the same pin from ns2 - should fail
-        let req = test::TestRequest::put()
-            .uri(&format!("/pin/ns2/{}", pin1.pin))
-            .set_json(&json!({"namespace": "ns2"}))
-            .to_request();
-        
-        let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), 404);
+        let response = server.put(&format!("/pin/ns2/{}", pin1.pin))
+            .json(&json!({"namespace": "ns2"}))
+            .await;
+        assert_eq!(response.status_code(), 404);
         
         // But we should be able to poll from the correct namespace
-        let req = test::TestRequest::post()
-            .uri(&format!("/pin/ns1/{}", pin1.pin))
-            .to_request();
+        let response = server.post(&format!("/pin/ns1/{}", pin1.pin)).await;
+        assert_eq!(response.status_code(), 200);
         
-        let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_success());
-        
-        let poll_response: PinResponse = test::read_body_json(resp).await;
+        let poll_response: PinResponse = response.json();
         assert!(poll_response.result.is_some());
         assert_eq!(poll_response.result.unwrap().get("namespace").unwrap(), &json!("ns1"));
     }

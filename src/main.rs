@@ -232,8 +232,9 @@ async fn main() -> anyhow::Result<()> {
 
     let app = create_router().with_state(state);
     
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    info!("Server running on http://0.0.0.0:8080");
+    let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    info!("Server running on http://{}", bind_addr);
     axum::serve(listener, app).await?;
 
     Ok(())

@@ -35,13 +35,72 @@ cargo build --release
 
 The service will start on `http://0.0.0.0:8080`
 
-### Docker Deployment
+### Docker Deployment (Recommended)
+
+The easiest way to deploy Biboop to a server is using Docker Compose:
 
 ```bash
-# Build AMD64 Docker image
-./scripts/make_amd64.sh
+# Clone the repository
+git clone <repository-url>
+cd configgy
 
-# The binary will be extracted to target/release/biboop-amd64
+# Deploy with Docker Compose (one command!)
+docker-compose up -d
+
+# Check service status
+docker-compose ps
+docker-compose logs biboop
+```
+
+The service will be available on port 8080 and will automatically restart if the server reboots.
+
+#### Custom Port Deployment
+
+To expose on a different port (e.g., port 3000):
+
+```bash
+# Edit docker-compose.yml and change ports section:
+# ports:
+#   - "3000:8080"  # External:Internal
+
+docker-compose up -d
+```
+
+#### Production Deployment
+
+For production use:
+
+```bash
+# Copy and customize environment file
+cp .env.example .env
+nano .env  # Set RUST_LOG=info or warn for production
+
+# Deploy
+docker-compose up -d
+
+# Monitor logs
+docker-compose logs -f biboop
+```
+
+#### Management Commands
+
+```bash
+# Start service
+docker-compose up -d
+
+# Stop service
+docker-compose down
+
+# Update service
+git pull
+docker-compose build
+docker-compose up -d
+
+# View logs
+docker-compose logs biboop
+
+# Check health
+curl http://localhost:8080/health
 ```
 
 ## API Reference

@@ -24,8 +24,8 @@ const STALE_AGE_MINS: i64 = 10;
 
 #[derive(Clone)]
 struct BiboopState {
-    read: evmap::ReadHandle<String, Box<PinItem>>,
-    write: Arc<Mutex<evmap::WriteHandle<String, Box<PinItem>>>>,
+    read: evmap::ReadHandle<String, PinItem>,
+    write: Arc<Mutex<evmap::WriteHandle<String, PinItem>>>,
 }
 
 // Need to implement Sync manually since evmap::ReadHandle contains Cell<()> 
@@ -38,11 +38,17 @@ struct PinResponse {
     result: Option<HashMap<String, Value>>,
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone)]
 struct PinItem {
     timestamp: DateTime<Utc>,
     pin: String,
     result: Option<HashMap<String, Value>>,
+}
+
+impl evmap::ShallowCopy for PinItem {
+    unsafe fn shallow_copy(&self) -> std::mem::ManuallyDrop<Self> {
+        std::mem::ManuallyDrop::new(self.clone())
+    }
 }
 
 #[allow(clippy::derive_hash_xor_eq)]
@@ -63,21 +69,27 @@ impl PinItem {
     }
 }
 
+// Helper function to create consistent keys
+fn create_key(namespace: &str, pin: &str) -> String {
+    format!("{}:{}", namespace, pin)
+}
+
 fn create_unique_pin(namespace: &str, state: &BiboopState) -> Option<String> {
     for _ in 0..10 {
         let pin: String = rng()
             .sample_iter(&Alphanumeric)
             .take(PIN_LENGTH)
             .map(char::from)
-            .collect();
-        let uc_pin = pin.to_uppercase();
-        let key = format!("{}:{}", namespace, uc_pin);
+            .collect::<String>()
+            .to_uppercase();
+        
+        let key = create_key(namespace, &pin);
 
         if !state.read.contains_key(&key) {
             if let Ok(mut write_handle) = state.write.lock() {
-                write_handle.insert(key, Box::new(PinItem::new(uc_pin.clone(), None)));
+                write_handle.insert(key, PinItem::new(pin.clone(), None));
                 write_handle.refresh();
-                return Some(uc_pin);
+                return Some(pin);
             }
         }
     }
@@ -105,19 +117,20 @@ fn get_and_remove_pin_if_populated(
     pin: &str,
     state: &BiboopState,
 ) -> Option<PinResponse> {
-    let key = format!("{}:{}", namespace, pin);
+    let key = create_key(namespace, pin);
     let item = state.read.get_one(&key)?;
-    let pin_item = item.as_ref();
-    let result = &pin_item.result;
-    if result.is_some() {
+    let pin_item = item.clone();
+    
+    if pin_item.result.is_some() {
         if let Ok(mut write_handle) = state.write.lock() {
             write_handle.empty(key);
             write_handle.refresh();
         }
     }
+    
     Some(PinResponse {
         pin: pin.to_string(),
-        result: result.clone(),
+        result: pin_item.result,
     })
 }
 
@@ -151,12 +164,12 @@ async fn respond_to_pin(
         return (StatusCode::PAYLOAD_TOO_LARGE, "Payload too large.").into_response();
     }
 
-    let key = format!("{}:{}", namespace, pin);
+    let key = create_key(&namespace, &pin);
     if state.read.contains_key(&key) {
         if let Ok(mut write_handle) = state.write.lock() {
             write_handle.update(
                 key,
-                Box::new(PinItem::new(pin.to_string(), Some(result))),
+                PinItem::new(pin.to_string(), Some(result)),
             );
             write_handle.refresh();
         }
@@ -184,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let (read, write) = evmap::new();
+    let (read, write) = evmap::new::<String, PinItem>();
     let state = BiboopState {
         read,
         write: Arc::new(Mutex::new(write)),
@@ -233,7 +246,7 @@ mod tests {
     use serde_json::json;
 
     fn create_test_state() -> BiboopState {
-        let (read, write) = evmap::new();
+        let (read, write) = evmap::new::<String, PinItem>();
         BiboopState {
             read,
             write: Arc::new(Mutex::new(write)),
@@ -308,7 +321,7 @@ mod tests {
         let state = create_test_state();
         let namespace = "test";
         let pin = "ABCD";
-        let key = format!("{}:{}", namespace, pin);
+        let key = create_key(namespace, pin);
         
         // Insert pin with data
         let mut data = HashMap::new();
@@ -316,7 +329,7 @@ mod tests {
         
         {
             let mut write_handle = state.write.lock().unwrap();
-            write_handle.insert(key.clone(), Box::new(PinItem::new(pin.to_string(), Some(data.clone()))));
+            write_handle.insert(key.clone(), PinItem::new(pin.to_string(), Some(data.clone())));
             write_handle.refresh();
         }
         
@@ -337,12 +350,12 @@ mod tests {
         let state = create_test_state();
         let namespace = "test";
         let pin = "ABCD";
-        let key = format!("{}:{}", namespace, pin);
+        let key = create_key(namespace, pin);
         
         // Insert pin without data
         {
             let mut write_handle = state.write.lock().unwrap();
-            write_handle.insert(key.clone(), Box::new(PinItem::new(pin.to_string(), None)));
+            write_handle.insert(key.clone(), PinItem::new(pin.to_string(), None));
             write_handle.refresh();
         }
         
@@ -511,5 +524,148 @@ mod tests {
         let poll_response: PinResponse = response.json();
         assert!(poll_response.result.is_some());
         assert_eq!(poll_response.result.unwrap().get("namespace").unwrap(), &json!("ns1"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_pin_creation() {
+        let state = create_test_state();
+        
+        // Test concurrent PIN creation at the function level
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let namespace = format!("concurrent_{}", i);
+            let state_clone = state.clone();
+            let handle = tokio::spawn(async move {
+                create_unique_pin(&namespace, &state_clone)
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all requests to complete
+        let mut pins = Vec::new();
+        for handle in handles {
+            if let Some(pin) = handle.await.unwrap() {
+                pins.push(pin);
+            }
+        }
+        
+        // Verify all PINs are unique
+        assert_eq!(pins.len(), 10, "All PIN creations should succeed");
+        pins.sort();
+        pins.dedup();
+        assert_eq!(pins.len(), 10, "All PINs should be unique");
+    }
+
+    #[tokio::test]
+    async fn test_high_frequency_operations() {
+        let state = create_test_state();
+        let app = create_router().with_state(state);
+        let server = TestServer::new(app).unwrap();
+        
+        let start = std::time::Instant::now();
+        
+        // Perform 100 rapid operations
+        for i in 0..100 {
+            let namespace = format!("perf_{}", i % 10); // Use 10 different namespaces
+            
+            // Create PIN
+            let response = server.post(&format!("/pin/{}", namespace)).await;
+            assert_eq!(response.status_code(), 200);
+            let pin_response: PinResponse = response.json();
+            
+            // Submit data
+            let test_data = json!({"iteration": i, "data": "performance_test"});
+            let response = server.put(&format!("/pin/{}/{}", namespace, pin_response.pin))
+                .json(&test_data).await;
+            assert_eq!(response.status_code(), 202);
+            
+            // Retrieve data
+            let response = server.post(&format!("/pin/{}/{}", namespace, pin_response.pin)).await;
+            assert_eq!(response.status_code(), 200);
+            let poll_response: PinResponse = response.json();
+            assert!(poll_response.result.is_some());
+        }
+        
+        let duration = start.elapsed();
+        println!("100 complete PIN operations took: {:?}", duration);
+        
+        // Should complete in reasonable time (less than 5 seconds on most systems)
+        assert!(duration.as_secs() < 5, "Operations should complete in under 5 seconds");
+    }
+
+    #[tokio::test]
+    async fn test_memory_usage_under_load() {
+        let state = create_test_state();
+        
+        // Create many PINs to test memory usage
+        let mut pins = Vec::new();
+        for i in 0..1000 {
+            let namespace = format!("memory_{}", i % 50);
+            if let Some(pin) = create_unique_pin(&namespace, &state) {
+                pins.push((namespace, pin));
+            }
+        }
+        
+        assert!(pins.len() >= 950, "Should be able to create most PINs");
+        
+        // Verify that evmap can handle this load
+        for (namespace, pin) in &pins[..100] {
+            let key = create_key(namespace, pin);
+            assert!(state.read.contains_key(&key), "PIN should exist in map");
+        }
+        
+        println!("Successfully created and verified {} PINs", pins.len());
+    }
+
+    #[tokio::test]
+    async fn test_namespace_scaling() {
+        let state = create_test_state();
+        
+        // Test concurrent operations at the function level rather than HTTP level
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let state_clone = state.clone();
+            let handle = tokio::spawn(async move {
+                let namespace = format!("scale_ns_{}", i);
+                
+                // Create PIN using direct function calls
+                let pin = create_unique_pin(&namespace, &state_clone).unwrap();
+                
+                // Submit data directly
+                let key = create_key(&namespace, &pin);
+                let mut test_data = HashMap::new();
+                test_data.insert("namespace_id".to_string(), serde_json::Value::Number(i.into()));
+                
+                {
+                    let mut write_handle = state_clone.write.lock().unwrap();
+                    write_handle.update(key.clone(), PinItem::new(pin.clone(), Some(test_data.clone())));
+                    write_handle.refresh();
+                }
+                
+                // Retrieve data
+                let retrieved = get_and_remove_pin_if_populated(&namespace, &pin, &state_clone);
+                assert!(retrieved.is_some());
+                let result = retrieved.unwrap();
+                
+                result.result.unwrap().get("namespace_id").unwrap().as_i64().unwrap()
+            });
+            handles.push(handle);
+        }
+        
+        // Collect results
+        let mut results = Vec::new();
+        for handle in handles {
+            let namespace_id = handle.await.unwrap();
+            results.push(namespace_id);
+        }
+        
+        // Verify all namespaces worked correctly
+        results.sort();
+        assert_eq!(results.len(), 50);
+        for (i, &result) in results.iter().enumerate() {
+            assert_eq!(result, i as i64);
+        }
+        
+        println!("Successfully handled {} concurrent namespaces", results.len());
     }
 }

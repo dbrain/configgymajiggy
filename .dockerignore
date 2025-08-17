@@ -1,2 +1,28 @@
+# Ignore build artifacts
+target/
+
+# Ignore development files
+.env
+.env.local
 .git
-target
+.gitignore
+
+# Ignore documentation
+*.md
+README.md
+
+# Ignore test files
+tests/
+
+# Ignore Docker files (except Dockerfile)
+docker-compose.yml
+.dockerignore
+
+# Ignore scripts
+scripts/
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo

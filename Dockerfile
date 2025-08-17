@@ -45,7 +45,7 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser
 WORKDIR /app
 
 # Copy binary from builder stage
-COPY --from=builder /usr/src/app/target/release/biboop /app/biboop
+COPY --from=builder /usr/src/app/target/release/configgymajiggy /app/configgymajiggy
 
 # Change ownership to app user
 RUN chown -R appuser:appuser /app
@@ -61,4 +61,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the application
-CMD ["./biboop"]
+CMD ["./configgymajiggy"]

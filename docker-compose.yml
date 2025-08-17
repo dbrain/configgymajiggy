@@ -1,7 +1,7 @@
 services:
-  biboop:
+  configgymajiggy:
     build: .
-    container_name: biboop-service
+    container_name: configgymajiggy-service
     ports:
       - "8080:8080"  # Expose on standard port, change left side for different external port
     environment:
@@ -16,8 +16,8 @@ services:
     volumes:
       - /etc/localtime:/etc/localtime:ro  # Sync timezone with host
     networks:
-      - biboop-network
+      - configgymajiggy-network
 
 networks:
-  biboop-network:
+  configgymajiggy-network:
     driver: bridge

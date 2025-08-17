@@ -1,39 +1,39 @@
 #!/bin/bash
 
-# Biboop Deployment Script
+# Configgymajiggy Deployment Script
 # This script provides easy deployment and management commands
 
 set -e
 
-echo "🚀 Biboop Deployment Script"
+echo "🚀 Configgymajiggy Deployment Script"
 echo "==========================="
 
 case "${1:-deploy}" in
     "deploy")
-        echo "📦 Building and deploying Biboop service..."
+        echo "📦 Building and deploying Configgymajiggy service..."
         docker-compose up -d --build
         echo "✅ Service deployed successfully!"
         echo "🌍 Access your service at: http://localhost:8080"
         echo "🔍 Check health: curl http://localhost:8080/health"
         ;;
     "start")
-        echo "▶️  Starting Biboop service..."
+        echo "▶️  Starting Configgymajiggy service..."
         docker-compose up -d
         echo "✅ Service started!"
         ;;
     "stop")
-        echo "⏹️  Stopping Biboop service..."
+        echo "⏹️  Stopping Configgymajiggy service..."
         docker-compose down
         echo "✅ Service stopped!"
         ;;
     "restart")
-        echo "🔄 Restarting Biboop service..."
+        echo "🔄 Restarting Configgymajiggy service..."
         docker-compose restart
         echo "✅ Service restarted!"
         ;;
     "logs")
         echo "📋 Showing service logs..."
-        docker-compose logs -f biboop
+        docker-compose logs -f configgymajiggy
         ;;
     "status")
         echo "📊 Service status:"

@@ -1,6 +1,8 @@
-# Biboop - PIN-based Temporary Data Exchange Service
+# Configgymajiggy - PIN-based Temporary Data Exchange Service
 
-Biboop is a lightweight Rust web service that provides temporary data exchange using short PIN codes. It's designed for scenarios where you need to briefly share data between systems without permanent storage.
+> ⚠️ **Warning**: Do not use this. I only made it public so I could hurt myself and deploy it to some hacky cloud instance easier, previously I was covering my shame by making it private.
+
+Configgymajiggy is a lightweight Rust web service that provides temporary data exchange using short PIN codes. It's designed for scenarios where you need to briefly share data between systems without permanent storage.
 
 ## Features
 
@@ -37,7 +39,7 @@ The service will start on `http://0.0.0.0:8080`
 
 ### Docker Deployment (Recommended)
 
-The easiest way to deploy Biboop to a server is using Docker Compose:
+The easiest way to deploy Configgymajiggy to a server is using Docker Compose:
 
 ```bash
 # Clone the repository
@@ -49,7 +51,7 @@ docker-compose up -d
 
 # Check service status
 docker-compose ps
-docker-compose logs biboop
+docker-compose logs configgymajiggy
 ```
 
 The service will be available on port 8080 and will automatically restart if the server reboots.
@@ -79,7 +81,7 @@ nano .env  # Set RUST_LOG=info or warn for production
 docker-compose up -d
 
 # Monitor logs
-docker-compose logs -f biboop
+docker-compose logs -f configgymajiggy
 ```
 
 #### Management Commands
@@ -97,7 +99,7 @@ docker-compose build
 docker-compose up -d
 
 # View logs
-docker-compose logs biboop
+docker-compose logs configgymajiggy
 
 # Check health
 curl http://localhost:8080/health
@@ -341,7 +343,7 @@ cargo test test_health_endpoint
 - `src/main.rs`: Main application with all endpoints and logic
 - `scripts/make_amd64.sh`: Docker build script
 - `Dockerfile-amd64`: Multi-stage Docker build
-- `scripts/biboop.service`: Systemd service file
+- `scripts/configgymajiggy.service`: Systemd service file
 
 ### Dependencies
 
@@ -364,14 +366,14 @@ Use the provided service file:
 
 ```bash
 # Copy service file
-sudo cp scripts/biboop.service /etc/systemd/system/
+sudo cp scripts/configgymajiggy.service /etc/systemd/system/
 
 # Enable and start
-sudo systemctl enable biboop
-sudo systemctl start biboop
+sudo systemctl enable configgymajiggy
+sudo systemctl start configgymajiggy
 
 # Check status
-sudo systemctl status biboop
+sudo systemctl status configgymajiggy
 ```
 
 ### Monitoring
@@ -383,7 +385,7 @@ Monitor the service health:
 curl http://localhost:8080/health
 
 # Check logs
-sudo journalctl -u biboop -f
+sudo journalctl -u configgymajiggy -f
 ```
 
 ### Security Considerations

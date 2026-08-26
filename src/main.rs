@@ -1,36 +1,40 @@
 use axum::{
+    Router,
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{get, post, put},
-    Router,
 };
+use chrono::TimeDelta;
 use chrono::prelude::{DateTime, Utc};
-use chrono::Duration;
-use clokwerk::{Scheduler, TimeUnits};
+use dashmap::{DashMap, mapref::entry::Entry};
 use log::info;
 use rand::distr::Alphanumeric;
-use rand::{rng, Rng};
+use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
 const PIN_LENGTH: usize = 4;
 const MAX_RESULT_SIZE_BYTES: usize = 3000;
 const STALE_AGE_MINS: i64 = 10;
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct BiboopState {
-    read: evmap::ReadHandle<String, PinItem>,
-    write: Arc<Mutex<evmap::WriteHandle<String, PinItem>>>,
+    pins: Arc<DashMap<String, PinItem>>,
 }
 
-// Need to implement Sync manually since evmap::ReadHandle contains Cell<()> 
-// which is not Sync, but in practice it's safe in our usage
-unsafe impl Sync for BiboopState {}
+impl BiboopState {
+    fn new() -> Self {
+        BiboopState {
+            pins: Arc::new(DashMap::new()),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct PinResponse {
@@ -38,40 +42,23 @@ struct PinResponse {
     result: Option<HashMap<String, Value>>,
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 struct PinItem {
     timestamp: DateTime<Utc>,
-    pin: String,
     result: Option<HashMap<String, Value>>,
 }
 
-impl evmap::ShallowCopy for PinItem {
-    unsafe fn shallow_copy(&self) -> std::mem::ManuallyDrop<Self> {
-        std::mem::ManuallyDrop::new(self.clone())
-    }
-}
-
-#[allow(clippy::derive_hash_xor_eq)]
-impl Hash for PinItem {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.timestamp.hash(state);
-        self.pin.hash(state);
-    }
-}
-
 impl PinItem {
-    fn new(pin: String, result: Option<HashMap<String, Value>>) -> Self {
+    fn new(result: Option<HashMap<String, Value>>) -> Self {
         PinItem {
             timestamp: Utc::now(),
-            pin,
             result,
         }
     }
 }
 
-// Helper function to create consistent keys
 fn create_key(namespace: &str, pin: &str) -> String {
-    format!("{}:{}", namespace, pin)
+    format!("{namespace}:{pin}")
 }
 
 fn create_unique_pin(namespace: &str, state: &BiboopState) -> Option<String> {
@@ -82,15 +69,10 @@ fn create_unique_pin(namespace: &str, state: &BiboopState) -> Option<String> {
             .map(char::from)
             .collect::<String>()
             .to_uppercase();
-        
-        let key = create_key(namespace, &pin);
 
-        if !state.read.contains_key(&key) {
-            if let Ok(mut write_handle) = state.write.lock() {
-                write_handle.insert(key, PinItem::new(pin.clone(), None));
-                write_handle.refresh();
-                return Some(pin);
-            }
+        if let Entry::Vacant(slot) = state.pins.entry(create_key(namespace, &pin)) {
+            slot.insert(PinItem::new(None));
+            return Some(pin);
         }
     }
     None
@@ -104,11 +86,14 @@ fn create_new_pin_response(namespace: &str, state: &BiboopState) -> Option<PinRe
     })
 }
 
-fn create_pin_http_response(namespace: &str, state: &BiboopState) -> impl IntoResponse {
-    let pin_response = create_new_pin_response(namespace, state);
-    match pin_response {
+fn create_pin_http_response(namespace: &str, state: &BiboopState) -> Response {
+    match create_new_pin_response(namespace, state) {
         Some(res) => Json(res).into_response(),
-        _ => (StatusCode::TOO_MANY_REQUESTS, "Could not find a free pin soon enough.").into_response(),
+        None => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Could not find a free pin soon enough.",
+        )
+            .into_response(),
     }
 }
 
@@ -118,36 +103,44 @@ fn get_and_remove_pin_if_populated(
     state: &BiboopState,
 ) -> Option<PinResponse> {
     let key = create_key(namespace, pin);
-    let item = state.read.get_one(&key)?;
-    let pin_item = item.clone();
-    
-    if pin_item.result.is_some() {
-        if let Ok(mut write_handle) = state.write.lock() {
-            write_handle.empty(key);
-            write_handle.refresh();
-        }
+
+    // remove_if keeps the read and the take under one shard lock, so two
+    // concurrent polls can never both consume the same result.
+    if let Some((_, item)) = state.pins.remove_if(&key, |_, item| item.result.is_some()) {
+        return Some(PinResponse {
+            pin: pin.to_string(),
+            result: item.result,
+        });
     }
-    
-    Some(PinResponse {
+
+    state.pins.contains_key(&key).then(|| PinResponse {
         pin: pin.to_string(),
-        result: pin_item.result,
+        result: None,
     })
 }
 
-async fn get_pin(
-    Path(namespace): Path<String>,
-    State(state): State<BiboopState>,
-) -> impl IntoResponse {
+fn remove_stale_pins(state: &BiboopState) {
+    let cutoff = Utc::now() - TimeDelta::minutes(STALE_AGE_MINS);
+    state.pins.retain(|key, item| {
+        let fresh = item.timestamp > cutoff;
+        if !fresh {
+            info!("Cleaning up stale key {key}");
+        }
+        fresh
+    });
+}
+
+async fn get_pin(Path(namespace): Path<String>, State(state): State<BiboopState>) -> Response {
     create_pin_http_response(&namespace, &state)
 }
 
 async fn poll_pin(
     Path((namespace, pin)): Path<(String, String)>,
     State(state): State<BiboopState>,
-) -> impl IntoResponse {
+) -> Response {
     match get_and_remove_pin_if_populated(&namespace, &pin, &state) {
         Some(pin_item) => Json(pin_item).into_response(),
-        _ => create_pin_http_response(&namespace, &state).into_response(),
+        None => create_pin_http_response(&namespace, &state),
     }
 }
 
@@ -155,27 +148,27 @@ async fn respond_to_pin(
     Path((namespace, pin)): Path<(String, String)>,
     State(state): State<BiboopState>,
     Json(result): Json<HashMap<String, Value>>,
-) -> impl IntoResponse {
+) -> Response {
     let serialized = match serde_json::to_string(&result) {
         Ok(s) => s,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to serialize data").into_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to serialize data",
+            )
+                .into_response();
+        }
     };
     if serialized.len() > MAX_RESULT_SIZE_BYTES {
         return (StatusCode::PAYLOAD_TOO_LARGE, "Payload too large.").into_response();
     }
 
-    let key = create_key(&namespace, &pin);
-    if state.read.contains_key(&key) {
-        if let Ok(mut write_handle) = state.write.lock() {
-            write_handle.update(
-                key,
-                PinItem::new(pin.to_string(), Some(result)),
-            );
-            write_handle.refresh();
+    match state.pins.get_mut(&create_key(&namespace, &pin)) {
+        Some(mut item) => {
+            *item = PinItem::new(Some(result));
+            (StatusCode::ACCEPTED, "Thanks!").into_response()
         }
-        (StatusCode::ACCEPTED, "Thanks!").into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "Pin not found.").into_response()
+        None => (StatusCode::NOT_FOUND, "Pin not found.").into_response(),
     }
 }
 
@@ -197,44 +190,22 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     env_logger::init();
 
-    let (read, write) = evmap::new::<String, PinItem>();
-    let state = BiboopState {
-        read,
-        write: Arc::new(Mutex::new(write)),
-    };
+    let state = BiboopState::new();
 
-    let mut scheduler = Scheduler::with_tz(chrono::Utc);
-    let clone_state = state.clone();
-    scheduler.every(10.seconds()).run(move || {
-        let mut keys_to_remove: Vec<String> = Vec::new();
-        if let Some(items) = &clone_state.read.read() {
-            for (key, pin_items) in items {
-                if let Some(pin_item) = pin_items.get_one() {
-                    let age = Utc::now().signed_duration_since(pin_item.timestamp);
-                    if age > Duration::minutes(STALE_AGE_MINS) {
-                        keys_to_remove.push(key.to_string())
-                    }
-                }
-            }
-        }
-
-        if !keys_to_remove.is_empty() {
-            if let Ok(mut write_handle) = clone_state.write.lock() {
-                for key in keys_to_remove {
-                    info!("Cleaning up stale key {}", key);
-                    write_handle.empty(key);
-                }
-                write_handle.refresh();
-            }
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CLEANUP_INTERVAL);
+        loop {
+            ticker.tick().await;
+            remove_stale_pins(&cleanup_state);
         }
     });
-    let _thread_handle = scheduler.watch_thread(std::time::Duration::from_millis(100));
 
     let app = create_router().with_state(state);
-    
+
     let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!("Server running on http://{}", bind_addr);
+    info!("Server running on http://{bind_addr}");
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -246,46 +217,38 @@ mod tests {
     use axum_test::TestServer;
     use serde_json::json;
 
-    fn create_test_state() -> BiboopState {
-        let (read, write) = evmap::new::<String, PinItem>();
-        BiboopState {
-            read,
-            write: Arc::new(Mutex::new(write)),
-        }
+    fn test_server_with(state: BiboopState) -> TestServer {
+        TestServer::new(create_router().with_state(state))
+    }
+
+    fn test_server() -> TestServer {
+        test_server_with(BiboopState::new())
+    }
+
+    fn sample_data() -> HashMap<String, Value> {
+        HashMap::from([("test".to_string(), json!("value"))])
     }
 
     #[tokio::test]
     async fn test_pin_item_creation() {
-        let pin = "TEST".to_string();
-        let result = Some(HashMap::new());
-        let item = PinItem::new(pin.clone(), result.clone());
-        
-        assert_eq!(item.pin, pin);
+        let result = Some(sample_data());
+        let item = PinItem::new(result.clone());
+
         assert_eq!(item.result, result);
         assert!(item.timestamp <= Utc::now());
     }
 
     #[tokio::test]
-    async fn test_pin_item_hash() {
-        let pin1 = PinItem::new("TEST".to_string(), None);
-        let pin2 = PinItem::new("TEST".to_string(), None);
-        
-        // Items with same pin and timestamp should not necessarily have same hash
-        // due to timestamp precision differences
-        assert_eq!(pin1.pin, pin2.pin);
-    }
-
-    #[tokio::test]
     async fn test_create_unique_pin() {
-        let state = create_test_state();
+        let state = BiboopState::new();
         let namespace = "test";
-        
+
         let pin1 = create_unique_pin(namespace, &state);
         assert!(pin1.is_some());
-        
+
         let pin1_val = pin1.unwrap();
         assert_eq!(pin1_val.len(), PIN_LENGTH);
-        
+
         // Second pin should be different
         let pin2 = create_unique_pin(namespace, &state);
         assert!(pin2.is_some());
@@ -295,12 +258,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_new_pin_response() {
-        let state = create_test_state();
-        let namespace = "test";
-        
-        let response = create_new_pin_response(namespace, &state);
+        let state = BiboopState::new();
+
+        let response = create_new_pin_response("test", &state);
         assert!(response.is_some());
-        
+
         let response = response.unwrap();
         assert_eq!(response.pin.len(), PIN_LENGTH);
         assert!(response.result.is_none());
@@ -308,91 +270,93 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_and_remove_pin_empty() {
-        let state = create_test_state();
-        let namespace = "test";
-        let pin = "ABCD";
-        
+        let state = BiboopState::new();
+
         // Pin doesn't exist
-        let result = get_and_remove_pin_if_populated(namespace, pin, &state);
+        let result = get_and_remove_pin_if_populated("test", "ABCD", &state);
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_get_and_remove_pin_with_data() {
-        let state = create_test_state();
+        let state = BiboopState::new();
         let namespace = "test";
         let pin = "ABCD";
         let key = create_key(namespace, pin);
-        
-        // Insert pin with data
-        let mut data = HashMap::new();
-        data.insert("test".to_string(), json!("value"));
-        
-        {
-            let mut write_handle = state.write.lock().unwrap();
-            write_handle.insert(key.clone(), PinItem::new(pin.to_string(), Some(data.clone())));
-            write_handle.refresh();
-        }
-        
-        // Retrieve and remove
+        let data = sample_data();
+
+        state
+            .pins
+            .insert(key.clone(), PinItem::new(Some(data.clone())));
+
         let result = get_and_remove_pin_if_populated(namespace, pin, &state);
         assert!(result.is_some());
-        
+
         let response = result.unwrap();
         assert_eq!(response.pin, pin);
         assert_eq!(response.result, Some(data));
-        
+
         // Should be removed now
-        assert!(!state.read.contains_key(&key));
+        assert!(!state.pins.contains_key(&key));
     }
 
     #[tokio::test]
     async fn test_get_and_remove_pin_without_data() {
-        let state = create_test_state();
+        let state = BiboopState::new();
         let namespace = "test";
         let pin = "ABCD";
         let key = create_key(namespace, pin);
-        
-        // Insert pin without data
-        {
-            let mut write_handle = state.write.lock().unwrap();
-            write_handle.insert(key.clone(), PinItem::new(pin.to_string(), None));
-            write_handle.refresh();
-        }
-        
+
+        state.pins.insert(key.clone(), PinItem::new(None));
+
         // Retrieve but don't remove (no data)
         let result = get_and_remove_pin_if_populated(namespace, pin, &state);
         assert!(result.is_some());
-        
+
         let response = result.unwrap();
         assert_eq!(response.pin, pin);
         assert!(response.result.is_none());
-        
+
         // Should still exist
-        assert!(state.read.contains_key(&key));
+        assert!(state.pins.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn test_remove_stale_pins() {
+        let state = BiboopState::new();
+
+        let mut stale = PinItem::new(None);
+        stale.timestamp = Utc::now() - TimeDelta::minutes(STALE_AGE_MINS + 1);
+        state.pins.insert(create_key("ns", "OLD1"), stale);
+
+        let mut borderline = PinItem::new(Some(sample_data()));
+        borderline.timestamp = Utc::now() - TimeDelta::minutes(STALE_AGE_MINS - 1);
+        state.pins.insert(create_key("ns", "OLD2"), borderline);
+
+        state
+            .pins
+            .insert(create_key("ns", "NEW1"), PinItem::new(None));
+
+        remove_stale_pins(&state);
+
+        assert!(!state.pins.contains_key(&create_key("ns", "OLD1")));
+        assert!(state.pins.contains_key(&create_key("ns", "OLD2")));
+        assert!(state.pins.contains_key(&create_key("ns", "NEW1")));
     }
 
     // Integration tests for HTTP endpoints
     #[tokio::test]
     async fn test_health_endpoint() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
-        let response = server.get("/health").await;
-        
+        let response = test_server().get("/health").await;
+
         assert_eq!(response.status_code(), 200);
         assert_eq!(response.text(), "All good.");
     }
 
     #[tokio::test]
     async fn test_get_pin_endpoint() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
-        let response = server.post("/pin/testns").await;
-        
+        let response = test_server().post("/pin/testns").await;
+
         assert_eq!(response.status_code(), 200);
         let body: PinResponse = response.json();
         assert_eq!(body.pin.len(), PIN_LENGTH);
@@ -401,12 +365,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_pin_nonexistent() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
-        let response = server.post("/pin/testns/FAKE").await;
-        
+        let response = test_server().post("/pin/testns/FAKE").await;
+
         assert_eq!(response.status_code(), 200);
         // Should return a new pin since the fake one doesn't exist
         let body: PinResponse = response.json();
@@ -416,60 +376,57 @@ mod tests {
 
     #[tokio::test]
     async fn test_respond_to_pin_nonexistent() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
-        let test_data = json!({"message": "test"});
-        
-        let response = server.put("/pin/testns/FAKE").json(&test_data).await;
-        
+        let response = test_server()
+            .put("/pin/testns/FAKE")
+            .json(&json!({"message": "test"}))
+            .await;
+
         assert_eq!(response.status_code(), 404);
         assert_eq!(response.text(), "Pin not found.");
     }
 
     #[tokio::test]
     async fn test_full_pin_workflow() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
+        let server = test_server();
+
         // Step 1: Create a new pin
         let response = server.post("/pin/workflow").await;
         assert_eq!(response.status_code(), 200);
-        
+
         let pin_response: PinResponse = response.json();
         let pin = pin_response.pin;
         assert!(pin_response.result.is_none());
-        
+
         // Step 2: Submit data to the pin
         let test_data = json!({
             "message": "Hello, World!",
             "number": 42,
             "array": [1, 2, 3]
         });
-        
-        let response = server.put(&format!("/pin/workflow/{}", pin)).json(&test_data).await;
+
+        let response = server
+            .put(&format!("/pin/workflow/{pin}"))
+            .json(&test_data)
+            .await;
         assert_eq!(response.status_code(), 202);
         assert_eq!(response.text(), "Thanks!");
-        
+
         // Step 3: Poll the pin to get the data
-        let response = server.post(&format!("/pin/workflow/{}", pin)).await;
+        let response = server.post(&format!("/pin/workflow/{pin}")).await;
         assert_eq!(response.status_code(), 200);
-        
+
         let poll_response: PinResponse = response.json();
         assert_eq!(poll_response.pin, pin);
-        assert!(poll_response.result.is_some());
-        
+
         let result = poll_response.result.unwrap();
         assert_eq!(result.get("message").unwrap(), &json!("Hello, World!"));
         assert_eq!(result.get("number").unwrap(), &json!(42));
         assert_eq!(result.get("array").unwrap(), &json!([1, 2, 3]));
-        
+
         // Step 4: Try to poll again - should return new pin since data was consumed
-        let response = server.post(&format!("/pin/workflow/{}", pin)).await;
+        let response = server.post(&format!("/pin/workflow/{pin}")).await;
         assert_eq!(response.status_code(), 200);
-        
+
         let new_poll_response: PinResponse = response.json();
         assert_ne!(new_poll_response.pin, pin); // Should be a new pin
         assert!(new_poll_response.result.is_none());
@@ -477,128 +434,149 @@ mod tests {
 
     #[tokio::test]
     async fn test_payload_too_large() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
-        // First create a pin
+        let server = test_server();
+
         let response = server.post("/pin/large").await;
         let pin_response: PinResponse = response.json();
         let pin = pin_response.pin;
-        
-        // Create a large payload (over 3KB)
-        let large_string = "x".repeat(4000);
-        let large_data = json!({"data": large_string});
-        
-        let response = server.put(&format!("/pin/large/{}", pin)).json(&large_data).await;
+
+        let large_data = json!({ "data": "x".repeat(MAX_RESULT_SIZE_BYTES + 1000) });
+
+        let response = server
+            .put(&format!("/pin/large/{pin}"))
+            .json(&large_data)
+            .await;
         assert_eq!(response.status_code(), 413);
         assert_eq!(response.text(), "Payload too large.");
     }
 
     #[tokio::test]
     async fn test_namespace_isolation() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
+        let server = test_server();
+
         // Create pins in different namespaces
-        let resp1 = server.post("/pin/ns1").await;
-        let resp2 = server.post("/pin/ns2").await;
-        
-        let pin1: PinResponse = resp1.json();
-        let _pin2: PinResponse = resp2.json();
-        
+        let pin1: PinResponse = server.post("/pin/ns1").await.json();
+        let _pin2: PinResponse = server.post("/pin/ns2").await.json();
+
         // Submit data to pin in ns1
-        let data1 = json!({"namespace": "ns1"});
-        server.put(&format!("/pin/ns1/{}", pin1.pin)).json(&data1).await;
-        
+        server
+            .put(&format!("/pin/ns1/{}", pin1.pin))
+            .json(&json!({"namespace": "ns1"}))
+            .await;
+
         // Try to access the same pin from ns2 - should fail
-        let response = server.put(&format!("/pin/ns2/{}", pin1.pin))
+        let response = server
+            .put(&format!("/pin/ns2/{}", pin1.pin))
             .json(&json!({"namespace": "ns2"}))
             .await;
         assert_eq!(response.status_code(), 404);
-        
+
         // But we should be able to poll from the correct namespace
         let response = server.post(&format!("/pin/ns1/{}", pin1.pin)).await;
         assert_eq!(response.status_code(), 200);
-        
+
         let poll_response: PinResponse = response.json();
-        assert!(poll_response.result.is_some());
-        assert_eq!(poll_response.result.unwrap().get("namespace").unwrap(), &json!("ns1"));
+        assert_eq!(
+            poll_response.result.unwrap().get("namespace").unwrap(),
+            &json!("ns1")
+        );
     }
 
     #[tokio::test]
     async fn test_concurrent_pin_creation() {
-        let state = create_test_state();
-        
-        // Test concurrent PIN creation at the function level
-        let mut handles = Vec::new();
-        for i in 0..10 {
-            let namespace = format!("concurrent_{}", i);
-            let state_clone = state.clone();
-            let handle = tokio::spawn(async move {
-                create_unique_pin(&namespace, &state_clone)
-            });
-            handles.push(handle);
-        }
-        
-        // Wait for all requests to complete
+        let state = BiboopState::new();
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(async move { create_unique_pin("concurrent", &state) })
+            })
+            .collect();
+
         let mut pins = Vec::new();
         for handle in handles {
             if let Some(pin) = handle.await.unwrap() {
                 pins.push(pin);
             }
         }
-        
-        // Verify all PINs are unique
+
         assert_eq!(pins.len(), 10, "All PIN creations should succeed");
         pins.sort();
         pins.dedup();
         assert_eq!(pins.len(), 10, "All PINs should be unique");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_result_consumed_exactly_once() {
+        let state = BiboopState::new();
+        let namespace = "once";
+        let pin = create_unique_pin(namespace, &state).unwrap();
+        state.pins.insert(
+            create_key(namespace, &pin),
+            PinItem::new(Some(sample_data())),
+        );
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let state = state.clone();
+                let (namespace, pin) = (namespace.to_string(), pin.clone());
+                tokio::spawn(async move {
+                    get_and_remove_pin_if_populated(&namespace, &pin, &state)
+                        .and_then(|response| response.result)
+                })
+            })
+            .collect();
+
+        let mut consumed = 0;
+        for handle in handles {
+            if handle.await.unwrap().is_some() {
+                consumed += 1;
+            }
+        }
+
+        assert_eq!(
+            consumed, 1,
+            "Result must be handed out to exactly one poller"
+        );
+    }
+
     #[tokio::test]
     async fn test_high_frequency_operations() {
-        let state = create_test_state();
-        let app = create_router().with_state(state);
-        let server = TestServer::new(app).unwrap();
-        
+        let server = test_server();
         let start = std::time::Instant::now();
-        
-        // Perform 100 rapid operations
+
         for i in 0..100 {
-            let namespace = format!("perf_{}", i % 10); // Use 10 different namespaces
-            
-            // Create PIN
-            let response = server.post(&format!("/pin/{}", namespace)).await;
+            let namespace = format!("perf_{}", i % 10);
+
+            let response = server.post(&format!("/pin/{namespace}")).await;
             assert_eq!(response.status_code(), 200);
             let pin_response: PinResponse = response.json();
-            
-            // Submit data
-            let test_data = json!({"iteration": i, "data": "performance_test"});
-            let response = server.put(&format!("/pin/{}/{}", namespace, pin_response.pin))
-                .json(&test_data).await;
+            let pin = pin_response.pin;
+
+            let response = server
+                .put(&format!("/pin/{namespace}/{pin}"))
+                .json(&json!({"iteration": i, "data": "performance_test"}))
+                .await;
             assert_eq!(response.status_code(), 202);
-            
-            // Retrieve data
-            let response = server.post(&format!("/pin/{}/{}", namespace, pin_response.pin)).await;
+
+            let response = server.post(&format!("/pin/{namespace}/{pin}")).await;
             assert_eq!(response.status_code(), 200);
             let poll_response: PinResponse = response.json();
             assert!(poll_response.result.is_some());
         }
-        
+
         let duration = start.elapsed();
-        println!("100 complete PIN operations took: {:?}", duration);
-        
-        // Should complete in reasonable time (less than 5 seconds on most systems)
-        assert!(duration.as_secs() < 5, "Operations should complete in under 5 seconds");
+        println!("100 complete PIN operations took: {duration:?}");
+        assert!(
+            duration.as_secs() < 5,
+            "Operations should complete in under 5 seconds"
+        );
     }
 
     #[tokio::test]
     async fn test_memory_usage_under_load() {
-        let state = create_test_state();
-        
-        // Create many PINs to test memory usage
+        let state = BiboopState::new();
+
         let mut pins = Vec::new();
         for i in 0..1000 {
             let namespace = format!("memory_{}", i % 50);
@@ -606,67 +584,53 @@ mod tests {
                 pins.push((namespace, pin));
             }
         }
-        
+
         assert!(pins.len() >= 950, "Should be able to create most PINs");
-        
-        // Verify that evmap can handle this load
+
         for (namespace, pin) in &pins[..100] {
-            let key = create_key(namespace, pin);
-            assert!(state.read.contains_key(&key), "PIN should exist in map");
+            assert!(
+                state.pins.contains_key(&create_key(namespace, pin)),
+                "PIN should exist in map"
+            );
         }
-        
-        println!("Successfully created and verified {} PINs", pins.len());
     }
 
     #[tokio::test]
     async fn test_namespace_scaling() {
-        let state = create_test_state();
-        
-        // Test concurrent operations at the function level rather than HTTP level
-        let mut handles = Vec::new();
-        for i in 0..50 {
-            let state_clone = state.clone();
-            let handle = tokio::spawn(async move {
-                let namespace = format!("scale_ns_{}", i);
-                
-                // Create PIN using direct function calls
-                let pin = create_unique_pin(&namespace, &state_clone).unwrap();
-                
-                // Submit data directly
-                let key = create_key(&namespace, &pin);
-                let mut test_data = HashMap::new();
-                test_data.insert("namespace_id".to_string(), serde_json::Value::Number(i.into()));
-                
-                {
-                    let mut write_handle = state_clone.write.lock().unwrap();
-                    write_handle.update(key.clone(), PinItem::new(pin.clone(), Some(test_data.clone())));
-                    write_handle.refresh();
-                }
-                
-                // Retrieve data
-                let retrieved = get_and_remove_pin_if_populated(&namespace, &pin, &state_clone);
-                assert!(retrieved.is_some());
-                let result = retrieved.unwrap();
-                
-                result.result.unwrap().get("namespace_id").unwrap().as_i64().unwrap()
-            });
-            handles.push(handle);
-        }
-        
-        // Collect results
+        let state = BiboopState::new();
+
+        let handles: Vec<_> = (0..50)
+            .map(|i| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let namespace = format!("scale_ns_{i}");
+                    let pin = create_unique_pin(&namespace, &state).unwrap();
+
+                    let data =
+                        HashMap::from([("namespace_id".to_string(), Value::Number(i.into()))]);
+                    state
+                        .pins
+                        .insert(create_key(&namespace, &pin), PinItem::new(Some(data)));
+
+                    let retrieved = get_and_remove_pin_if_populated(&namespace, &pin, &state);
+                    retrieved
+                        .unwrap()
+                        .result
+                        .unwrap()
+                        .get("namespace_id")
+                        .unwrap()
+                        .as_i64()
+                        .unwrap()
+                })
+            })
+            .collect();
+
         let mut results = Vec::new();
         for handle in handles {
-            let namespace_id = handle.await.unwrap();
-            results.push(namespace_id);
+            results.push(handle.await.unwrap());
         }
-        
-        // Verify all namespaces worked correctly
+
         results.sort();
-        assert_eq!(results.len(), 50);
-        for (i, &result) in results.iter().enumerate() {
-            assert_eq!(result, i as i64);
-        }
-        
-        println!("Successfully handled {} concurrent namespaces", results.len());
+        assert_eq!(results, (0..50).collect::<Vec<i64>>());
     }
 }

@@ -2,19 +2,15 @@ services:
   configgymajiggy:
     build: .
     container_name: configgymajiggy-service
+    # Override in .env to expose on a different host port.
     ports:
-      - "8080:8080"  # Expose on standard port, change left side for different external port
+      - "${EXTERNAL_PORT:-8080}:8080"
     environment:
-      - RUST_LOG=info
-    restart: unless-stopped  # Always restart unless manually stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      - RUST_LOG=${RUST_LOG:-info}
+    restart: unless-stopped
+    # Healthcheck comes from the Dockerfile.
     volumes:
-      - /etc/localtime:/etc/localtime:ro  # Sync timezone with host
+      - /etc/localtime:/etc/localtime:ro
     networks:
       - configgymajiggy-network
 

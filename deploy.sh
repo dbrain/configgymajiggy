@@ -11,33 +11,33 @@ echo "==========================="
 case "${1:-deploy}" in
     "deploy")
         echo "📦 Building and deploying Configgymajiggy service..."
-        docker-compose up -d --build
+        docker compose up -d --build
         echo "✅ Service deployed successfully!"
         echo "🌍 Access your service at: http://localhost:8080"
         echo "🔍 Check health: curl http://localhost:8080/health"
         ;;
     "start")
         echo "▶️  Starting Configgymajiggy service..."
-        docker-compose up -d
+        docker compose up -d
         echo "✅ Service started!"
         ;;
     "stop")
         echo "⏹️  Stopping Configgymajiggy service..."
-        docker-compose down
+        docker compose down
         echo "✅ Service stopped!"
         ;;
     "restart")
         echo "🔄 Restarting Configgymajiggy service..."
-        docker-compose restart
+        docker compose restart
         echo "✅ Service restarted!"
         ;;
     "logs")
         echo "📋 Showing service logs..."
-        docker-compose logs -f configgymajiggy
+        docker compose logs -f configgymajiggy
         ;;
     "status")
         echo "📊 Service status:"
-        docker-compose ps
+        docker compose ps
         echo ""
         echo "🔍 Health check:"
         curl -f http://localhost:8080/health 2>/dev/null && echo " ✅ Service is healthy" || echo " ❌ Service is not responding"
@@ -45,13 +45,13 @@ case "${1:-deploy}" in
     "update")
         echo "🔄 Updating service..."
         git pull
-        docker-compose build
-        docker-compose up -d
+        docker compose build
+        docker compose up -d
         echo "✅ Service updated!"
         ;;
     "clean")
         echo "🧹 Cleaning up..."
-        docker-compose down
+        docker compose down
         docker system prune -f
         echo "✅ Cleanup complete!"
         ;;

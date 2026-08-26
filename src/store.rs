@@ -4,6 +4,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::Notify;
@@ -119,6 +120,9 @@ pub struct PinStore {
     /// Millis-since-`started` of the last completed sweep, so readiness can tell
     /// whether the cleanup task is still alive.
     last_sweep_ms: Arc<AtomicU64>,
+    /// Wrong guesses across every namespace. Only touched on the miss path,
+    /// which legitimate traffic barely exercises, so the lock is uncontended.
+    global_misses: Arc<Mutex<NamespaceState>>,
 }
 
 impl PinStore {
@@ -129,6 +133,7 @@ impl PinStore {
             config,
             started: Instant::now(),
             last_sweep_ms: Arc::new(AtomicU64::new(0)),
+            global_misses: Arc::new(Mutex::new(NamespaceState::default())),
         }
     }
 
@@ -160,10 +165,25 @@ impl PinStore {
             return true;
         }
 
-        let mut state = self.namespaces.entry(namespace.clone()).or_default();
-        state.roll_window(self.config.probe_window);
-        state.misses = state.misses.saturating_add(1);
-        state.misses > self.config.max_probe_misses
+        let over_namespace_budget = {
+            let mut state = self.namespaces.entry(namespace.clone()).or_default();
+            state.roll_window(self.config.probe_window);
+            state.misses = state.misses.saturating_add(1);
+            state.misses > self.config.max_probe_misses
+        };
+
+        // Guard dropped above before taking the global lock.
+        let over_global_budget = {
+            let mut global = self
+                .global_misses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            global.roll_window(self.config.probe_window);
+            global.misses = global.misses.saturating_add(1);
+            global.misses > self.config.max_global_misses
+        };
+
+        over_namespace_budget || over_global_budget
     }
 
     fn release_pin(&self, namespace: &Namespace) {
@@ -650,6 +670,66 @@ mod tests {
         assert_eq!(store.poll(&real), Poll::Pending);
         assert_eq!(store.deposit(&real, payload("x")), Deposit::Accepted);
         assert!(matches!(store.poll(&real), Poll::Delivered(_)));
+    }
+
+    #[test]
+    fn spreading_guesses_across_namespaces_still_hits_a_global_ceiling() {
+        // The per-namespace budget alone is unbounded in total: namespaces are
+        // free to invent, so a guesser just rotates them. The global ceiling is
+        // what actually bounds the guess rate.
+        let store = PinStore::new(Arc::new(Config {
+            max_probe_misses: 1000,
+            max_global_misses: 5,
+            ..Config::default()
+        }));
+        let pin = Pin::parse(
+            &"Z".repeat(Config::default().pin_length),
+            Config::default().pin_length,
+        )
+        .unwrap();
+
+        for i in 0..5 {
+            let key = PinKey::new(namespace(&format!("spray{i}")), pin.clone());
+            assert_eq!(
+                store.poll(&key),
+                Poll::Unknown,
+                "guess {i} should be allowed"
+            );
+        }
+
+        let key = PinKey::new(namespace("spray-final"), pin);
+        assert_eq!(
+            store.poll(&key),
+            Poll::Throttled,
+            "a fresh namespace must not buy a fresh budget"
+        );
+    }
+
+    #[test]
+    fn the_global_ceiling_does_not_touch_legitimate_traffic() {
+        let store = PinStore::new(Arc::new(Config {
+            max_global_misses: 1,
+            ..Config::default()
+        }));
+        let ns = namespace("busy");
+        let key = allocated(&store, &ns);
+
+        // Burn the global budget from elsewhere.
+        let bogus = PinKey::new(
+            namespace("guesser"),
+            Pin::parse(
+                &"Z".repeat(store.config().pin_length),
+                store.config().pin_length,
+            )
+            .unwrap(),
+        );
+        assert_eq!(store.poll(&bogus), Poll::Unknown);
+        assert_eq!(store.poll(&bogus), Poll::Throttled);
+
+        // A caller holding a real pin never consults the budget at all.
+        assert_eq!(store.poll(&key), Poll::Pending);
+        assert_eq!(store.deposit(&key, payload("x")), Deposit::Accepted);
+        assert!(matches!(store.poll(&key), Poll::Delivered(_)));
     }
 
     #[test]

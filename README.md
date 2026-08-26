@@ -74,7 +74,7 @@ Copy `.env.example` to `.env`. Compose reads it automatically; both are optional
 |---|---|---|
 | `RUST_LOG` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
 | `EXTERNAL_PORT` | `8080` | Host port to publish on. The container always listens on 8080 internally. |
-| `PIN_LENGTH` | `4` | Characters per PIN. Each one adds 5 bits. |
+| `PIN_LENGTH` | `10` | Characters per PIN. Each one adds 5 bits. |
 | `STALE_AGE_MINS` | `10` | Minutes of inactivity before a PIN is evicted. |
 | `MAX_PAYLOAD_BYTES` | `3000` | Largest `PUT` body accepted, measured on the wire. |
 | `MAX_ENTRIES` | `100000` | Hard cap on live PINs; allocation returns `503` past it. |
@@ -83,6 +83,7 @@ Copy `.env.example` to `.env`. Compose reads it automatically; both are optional
 | `CORS_ALLOWED_ORIGINS` | *(empty)* | Comma-separated origin allowlist. Empty means any origin. |
 | `MAX_PINS_PER_NAMESPACE` | `1000` | Live PINs one namespace may hold. |
 | `MAX_PROBE_MISSES` | `60` | Wrong-PIN guesses per namespace per window before `429`. |
+| `MAX_GLOBAL_MISSES` | `600` | Wrong-PIN guesses across *all* namespaces per window. |
 | `PROBE_WINDOW_SECS` | `60` | Length of that window. |
 | `MAX_LONG_POLL_SECS` | `30` | Ceiling on `?wait=`. |
 | `PUBLISH_ADDRESS` | `0.0.0.0` | *(compose only)* Host interface to publish on. |
@@ -114,7 +115,7 @@ Namespaces partition the PIN space — the same PIN string in two namespaces ref
 
 ```bash
 curl -X POST http://localhost:8080/pin/myapp
-# 200 {"pin":"A7X9","result":null}
+# 200 {"pin":"K7M2P9XRJ4","result":null}
 ```
 
 Returns `503` with a `Retry-After` header if the namespace is saturated (10 allocation attempts collided) or the service is at `MAX_ENTRIES`.
@@ -147,7 +148,9 @@ It returns the moment the payload lands, or `{"result":null}` when the wait elap
 
 #### Guess throttling
 
-Repeatedly polling PINs that don't exist earns a `429` with `Retry-After` after `MAX_PROBE_MISSES` misses in `PROBE_WINDOW_SECS`, counted per namespace. Only *unknown* PINs count toward it, so a caller holding a real PIN is never throttled by someone else's guessing.
+Repeatedly polling PINs that don't exist earns a `429` with `Retry-After`. Two budgets apply, both per `PROBE_WINDOW_SECS`: `MAX_PROBE_MISSES` per namespace, and `MAX_GLOBAL_MISSES` across all of them. The global one matters because namespaces are free to invent — without it a guesser just rotates namespaces and the total guess rate is unbounded.
+
+Only *unknown* PINs count toward either budget, and the budget is consulted only after a lookup has already missed. So a caller holding a real PIN is never throttled by someone else's guessing, and legitimate traffic — which essentially never misses — doesn't interact with this at all.
 
 ### Submit a payload
 
@@ -232,7 +235,7 @@ Needs Rust 1.85+ (edition 2024).
 cargo run                              # serves on 0.0.0.0:8080
 BIND_ADDRESS=127.0.0.1:3000 cargo run  # or somewhere else
 
-cargo test                                     # 55 unit + integration tests
+cargo test                                     # 58 unit + integration tests
 cargo clippy --all-targets -- -D warnings      # pedantic; clean
 cargo fmt
 ```
@@ -273,8 +276,8 @@ if it parsed, so handlers downstream cannot see an unvalidated one.
 
 - **In memory only.** A restart drops every PIN and payload. `docker compose up -d --build` therefore loses in-flight exchanges.
 - **No authentication.** Anyone who reaches the port can allocate PINs and read any PIN they guess.
-- **PINs are short.** The alphabet is a uniform 32 symbols, so the default 4 characters is 20 bits — about 1.05M combinations. That is brute-forceable in minutes by anyone who can reach the port, and there is no rate limiting here to stop them. Raise `PIN_LENGTH` (each character is another 5 bits) when the PINs guard anything worth stealing; 4 is the default because the point of the service is a code a human can read aloud.
-- **Guess throttling is per namespace, in memory, single instance.** It bounds PIN guessing but is not a general request rate limiter, and it resets on restart. Put a reverse proxy in front if the port is exposed.
+- **A PIN is a bearer token, and it is the only access control.** Anyone holding it reads the payload, so its width is the whole security story. The alphabet is a uniform 32 symbols, so the default 10 characters is 50 bits (~1.1e15) — out of reach even for an attacker who ignores the throttling entirely. Lowering `PIN_LENGTH` costs 5 bits per character and gets bad fast: at 4 characters it is ~1.05M, which a single host sweeps in hours.
+- **Guess throttling is in memory, single instance, and best-effort.** It bounds guessing and resets on restart; it is not a general request rate limiter, and it is not what makes PINs safe — `PIN_LENGTH` is. Put a reverse proxy in front if the port is exposed.
 - **CORS defaults to any origin.** Set `CORS_ALLOWED_ORIGINS` to restrict it.
 - **Memory is bounded only by `MAX_ENTRIES` and the TTL.** A burst of allocations holds memory for `STALE_AGE_MINS`; the compose file caps the container at 512 MB.
 

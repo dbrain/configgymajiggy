@@ -4,7 +4,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 pub const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8080";
-pub const DEFAULT_PIN_LENGTH: usize = 4;
+/// 32^10 is ~1.1e15: unguessable even with no throttle at all, which is the
+/// point - a pin is a bearer token for whatever was stashed under it, and this
+/// service has no other access control. The JSON contract is unchanged by the
+/// length, so clients that treat the pin as opaque need no update.
+pub const DEFAULT_PIN_LENGTH: usize = 10;
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 3000;
 pub const DEFAULT_STALE_AGE_MINS: u64 = 10;
 pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 10;
@@ -12,6 +16,11 @@ pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_PINS_PER_NAMESPACE: usize = 1000;
 pub const DEFAULT_MAX_PROBE_MISSES: u32 = 60;
+/// Ceiling on wrong guesses across *all* namespaces per window. A per-namespace
+/// budget alone is unbounded in total, since namespaces are free to invent.
+/// Legitimate clients essentially never miss - a miss means asking for a pin
+/// that does not exist - so this can sit far below normal traffic.
+pub const DEFAULT_MAX_GLOBAL_MISSES: u32 = 600;
 pub const DEFAULT_PROBE_WINDOW_SECS: u64 = 60;
 pub const DEFAULT_MAX_LONG_POLL_SECS: u64 = 30;
 
@@ -35,6 +44,7 @@ pub struct Config {
     pub allowed_origins: Vec<String>,
     pub max_pins_per_namespace: usize,
     pub max_probe_misses: u32,
+    pub max_global_misses: u32,
     pub probe_window: Duration,
     pub max_long_poll: Duration,
 }
@@ -73,6 +83,7 @@ impl Default for Config {
             allowed_origins: Vec::new(),
             max_pins_per_namespace: DEFAULT_MAX_PINS_PER_NAMESPACE,
             max_probe_misses: DEFAULT_MAX_PROBE_MISSES,
+            max_global_misses: DEFAULT_MAX_GLOBAL_MISSES,
             probe_window: Duration::from_secs(DEFAULT_PROBE_WINDOW_SECS),
             max_long_poll: Duration::from_secs(DEFAULT_MAX_LONG_POLL_SECS),
         }
@@ -110,6 +121,7 @@ impl Config {
                 DEFAULT_MAX_PINS_PER_NAMESPACE,
             )?,
             max_probe_misses: parse("MAX_PROBE_MISSES", DEFAULT_MAX_PROBE_MISSES)?,
+            max_global_misses: parse("MAX_GLOBAL_MISSES", DEFAULT_MAX_GLOBAL_MISSES)?,
             probe_window: Duration::from_secs(parse(
                 "PROBE_WINDOW_SECS",
                 DEFAULT_PROBE_WINDOW_SECS,
@@ -129,7 +141,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        let checks: [(&'static str, bool, &str); 9] = [
+        let checks: [(&'static str, bool, &str); 10] = [
             (
                 "PIN_LENGTH",
                 (1..=PIN_LENGTH_LIMIT).contains(&self.pin_length),
@@ -168,6 +180,11 @@ impl Config {
             (
                 "MAX_PROBE_MISSES",
                 self.max_probe_misses > 0,
+                "must be greater than zero",
+            ),
+            (
+                "MAX_GLOBAL_MISSES",
+                self.max_global_misses > 0,
                 "must be greater than zero",
             ),
             (

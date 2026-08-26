@@ -47,19 +47,20 @@ Two invariants worth preserving:
 
 - `cargo build` / `cargo run`: build and run (serves on `0.0.0.0:8080` by default)
 - `cargo check`: quick compilation check
-- `cargo test`: 55 unit and integration tests
+- `cargo test`: 58 unit and integration tests
 - `cargo clippy --all-targets -- -D warnings`: lint gate. The crate sets `#![warn(clippy::pedantic)]`, so this is the pedantic bar, and it is clean.
 - `cargo fmt`
 - `docker compose up -d --build` (or `./deploy.sh`): build the image and run the service
 
 ### Configuration
 
-Everything is environment-driven with validated defaults (see `src/config.rs` and `.env.example`): `BIND_ADDRESS`, `PIN_LENGTH`, `STALE_AGE_MINS`, `MAX_PAYLOAD_BYTES`, `MAX_ENTRIES`, `CLEANUP_INTERVAL_SECS`, `REQUEST_TIMEOUT_SECS`, `CORS_ALLOWED_ORIGINS`, `MAX_PINS_PER_NAMESPACE`, `MAX_PROBE_MISSES`, `PROBE_WINDOW_SECS`, `MAX_LONG_POLL_SECS`. Invalid values are rejected at startup rather than silently falling back. `dotenvy` loads `.env` when running outside Docker; logging is `env_logger` via `RUST_LOG`.
+Everything is environment-driven with validated defaults (see `src/config.rs` and `.env.example`): `BIND_ADDRESS`, `PIN_LENGTH`, `STALE_AGE_MINS`, `MAX_PAYLOAD_BYTES`, `MAX_ENTRIES`, `CLEANUP_INTERVAL_SECS`, `REQUEST_TIMEOUT_SECS`, `CORS_ALLOWED_ORIGINS`, `MAX_PINS_PER_NAMESPACE`, `MAX_PROBE_MISSES`, `MAX_GLOBAL_MISSES`, `PROBE_WINDOW_SECS`, `MAX_LONG_POLL_SECS`. Invalid values are rejected at startup rather than silently falling back. `dotenvy` loads `.env` when running outside Docker; logging is `env_logger` via `RUST_LOG`.
 
 ## Security notes
 
-- PINs are bearer tokens. The default 4 characters over a 32-symbol alphabet is only 20 bits — raise `PIN_LENGTH` if the payloads matter. There is no auth.
-- **Guess throttling is consulted only after a lookup has already missed.** That ordering is deliberate: it throttles enumeration without letting a guesser lock out the namespace's legitimate user. It is per-namespace, in-process, and resets on restart — a bound on guessing, not a general rate limiter.
+- **A PIN is a bearer token and the only access control.** Its width is the entire security story: the default 10 characters over a 32-symbol alphabet is 50 bits, out of reach even unthrottled. `pin.rs` has a test asserting the default stays at or above 48 bits — do not lower it to make PINs prettier. There is no auth.
+- **Guess throttling is consulted only after a lookup has already missed.** That ordering is deliberate: it throttles enumeration without letting a guesser lock out the namespace's legitimate user, and legitimate traffic (which barely ever misses) never touches it.
+- **Two budgets: per namespace and global.** The global one is the load-bearing half — namespaces are free to invent, so a per-namespace budget alone leaves the total guess rate unbounded. Throttling is defence in depth; `PIN_LENGTH` is the actual defence.
 - Both bookkeeping maps are bounded. `namespaces` is capped at `MAX_ENTRIES` and fails *closed* (treating an unknown namespace as throttled) when full, so filling it cannot buy unthrottled guessing; `sweep` prunes idle entries.
 - **Never log a namespace or PIN.** The namespace is the only access control this service has, and logs are read by more people than memory is.
 - Payload size is enforced by `DefaultBodyLimit` before the body is buffered, so an oversized request is never parsed.

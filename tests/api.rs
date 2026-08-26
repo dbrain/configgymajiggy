@@ -12,6 +12,12 @@ fn server() -> (TestServer, PinStore) {
     server_with(Config::default())
 }
 
+/// A syntactically valid pin that was never allocated. Built from the configured
+/// length so these tests keep working when PIN_LENGTH changes.
+fn unknown_pin(seed: char) -> String {
+    std::iter::repeat_n(seed, Config::default().pin_length).collect()
+}
+
 async fn allocate(server: &TestServer, namespace: &str) -> String {
     let response = server.post(&format!("/pin/{namespace}")).await;
     assert_eq!(response.status_code(), 200, "allocation should succeed");
@@ -59,7 +65,9 @@ async fn structured_namespace_cannot_be_aliased_from_its_parent() {
 async fn polling_an_unknown_pin_is_not_found_and_allocates_nothing() {
     let (server, store) = server();
 
-    let response = server.post("/pin/probe/ZZZZ").await;
+    let response = server
+        .post(&format!("/pin/probe/{}", unknown_pin('Z')))
+        .await;
     assert_eq!(response.status_code(), 404);
     assert_eq!(
         store.len(),
@@ -73,7 +81,8 @@ async fn probing_cannot_grow_the_map() {
     let (server, store) = server();
 
     for i in 0..50 {
-        server.post(&format!("/pin/probe/Q{i:03}")).await;
+        let pin = format!("{:Z<width$}", i, width = Config::default().pin_length);
+        server.post(&format!("/pin/probe/{pin}")).await;
     }
 
     assert_eq!(
@@ -199,7 +208,9 @@ async fn wrong_shaped_pins_are_rejected() {
 async fn errors_are_json() {
     let (server, _store) = server();
 
-    let response = server.post("/pin/jsonerr/ZZZZ").await;
+    let response = server
+        .post(&format!("/pin/jsonerr/{}", unknown_pin('Z')))
+        .await;
     assert_eq!(response.status_code(), 404);
     let body: Value = response.json();
     assert!(
@@ -316,10 +327,18 @@ async fn repeated_wrong_guesses_get_throttled() {
 
     // A brute-forcer sweeping the keyspace only gets a handful of tries.
     for _ in 0..5 {
-        assert_eq!(server.post("/pin/guessy/ZZZZ").await.status_code(), 404);
+        assert_eq!(
+            server
+                .post(&format!("/pin/guessy/{}", unknown_pin('Z')))
+                .await
+                .status_code(),
+            404
+        );
     }
 
-    let throttled = server.post("/pin/guessy/YYYY").await;
+    let throttled = server
+        .post(&format!("/pin/guessy/{}", unknown_pin('Y')))
+        .await;
     assert_eq!(
         throttled.status_code(),
         429,
@@ -335,14 +354,27 @@ async fn throttling_is_scoped_to_the_guessed_namespace() {
         ..Config::default()
     });
 
+    let bogus = unknown_pin('Z');
     for _ in 0..4 {
-        server.post("/pin/noisy/ZZZZ").await;
+        server.post(&format!("/pin/noisy/{bogus}")).await;
     }
-    assert_eq!(server.post("/pin/noisy/ZZZZ").await.status_code(), 429);
+    assert_eq!(
+        server
+            .post(&format!("/pin/noisy/{bogus}"))
+            .await
+            .status_code(),
+        429
+    );
 
     // An unrelated tenant must be unaffected.
     assert_eq!(server.post("/pin/quiet").await.status_code(), 200);
-    assert_eq!(server.post("/pin/quiet/ZZZZ").await.status_code(), 404);
+    assert_eq!(
+        server
+            .post(&format!("/pin/quiet/{bogus}"))
+            .await
+            .status_code(),
+        404
+    );
 }
 
 #[tokio::test]

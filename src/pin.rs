@@ -93,6 +93,20 @@ mod tests {
     }
 
     #[test]
+    fn the_default_pin_is_wide_enough_to_resist_guessing() {
+        // A pin is a bearer token on a public endpoint with no other access
+        // control, so the default has to survive an unthrottled attacker.
+        let alphabet = u128::try_from(ALPHABET.len()).unwrap();
+        let length = u32::try_from(crate::config::DEFAULT_PIN_LENGTH).unwrap();
+        let keyspace = alphabet.pow(length);
+
+        assert!(
+            keyspace >= 1 << 48,
+            "default pin space is only {keyspace}; brute force becomes practical"
+        );
+    }
+
+    #[test]
     fn generated_pins_are_valid_and_the_right_length() {
         for length in [1, 4, 8, 32] {
             let pin = Pin::generate(length);

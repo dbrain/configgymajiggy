@@ -7,19 +7,15 @@ target/
 .git
 .gitignore
 
+# Ignore test sources (not built by `cargo build --release`)
+tests/
+
 # Ignore documentation
 *.md
-README.md
-
-# Ignore test files
-tests/
 
 # Ignore Docker files (except Dockerfile)
 docker-compose.yml
 .dockerignore
-
-# Ignore scripts
-scripts/
 
 # Ignore IDE files
 .vscode/

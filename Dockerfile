@@ -6,48 +6,41 @@ WORKDIR /usr/src/app
 # Copy manifest files
 COPY Cargo.toml Cargo.lock ./
 
-# Create dummy source to cache dependencies
+# Create dummy sources to cache the dependency build
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
     cargo build --release --locked
 
 # Copy real source code
 COPY src ./src
 
 # COPY preserves context mtimes, which can be older than the dummy build's
-# fingerprint - touch forces cargo to actually rebuild the binary.
-RUN touch src/main.rs && cargo build --release --locked
+# fingerprint - touching every source forces cargo to actually rebuild.
+RUN find src -type f -exec touch {} + && cargo build --release --locked
 
 # Production stage
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app user for security
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
-# Create app directory
 WORKDIR /app
 
-# Copy binary from builder stage
-COPY --from=builder /usr/src/app/target/release/configgymajiggy /app/configgymajiggy
+# root-owned and read-only: the runtime user must not be able to rewrite its
+# own executable.
+COPY --from=builder --chown=root:root --chmod=0555 \
+    /usr/src/app/target/release/configgymajiggy /app/configgymajiggy
 
-# Change ownership to app user
-RUN chown -R appuser:appuser /app
-
-# Switch to non-root user
 USER appuser
 
-# Expose port
 EXPOSE 8080
 
-# Health check
+# The binary probes itself, so the image needs no HTTP client of its own.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD ["/app/configgymajiggy", "--health-check"]
 
-# Run the application
-CMD ["./configgymajiggy"]
+CMD ["/app/configgymajiggy"]

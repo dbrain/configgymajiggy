@@ -3,7 +3,11 @@
 # Configgymajiggy Deployment Script
 # This script provides easy deployment and management commands
 
-set -e
+set -Eeuo pipefail
+
+# shellcheck disable=SC1091
+[ -f .env ] && . ./.env
+PORT="${EXTERNAL_PORT:-8080}"
 
 echo "🚀 Configgymajiggy Deployment Script"
 echo "==========================="
@@ -13,8 +17,8 @@ case "${1:-deploy}" in
         echo "📦 Building and deploying Configgymajiggy service..."
         docker compose up -d --build
         echo "✅ Service deployed successfully!"
-        echo "🌍 Access your service at: http://localhost:8080"
-        echo "🔍 Check health: curl http://localhost:8080/health"
+        echo "🌍 Access your service at: http://localhost:${PORT}"
+        echo "🔍 Check health: curl http://localhost:${PORT}/health"
         ;;
     "start")
         echo "▶️  Starting Configgymajiggy service..."
@@ -40,33 +44,34 @@ case "${1:-deploy}" in
         docker compose ps
         echo ""
         echo "🔍 Health check:"
-        curl -f http://localhost:8080/health 2>/dev/null && echo " ✅ Service is healthy" || echo " ❌ Service is not responding"
+        if curl -fsS "http://localhost:${PORT}/health" >/dev/null 2>&1; then
+            echo " ✅ Service is healthy"
+        else
+            echo " ❌ Service is not responding on port ${PORT}"
+        fi
         ;;
     "update")
         echo "🔄 Updating service..."
-        git pull
-        docker compose build
-        docker compose up -d
-        echo "✅ Service updated!"
+        if [ -n "$(git status --porcelain)" ]; then
+            echo "❌ Working tree is dirty. Commit or stash before updating." >&2
+            exit 1
+        fi
+        git pull --ff-only
+        docker compose up -d --build
+        echo "✅ Updated to $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
         ;;
     "clean")
+        # Scoped to this project only - never `docker system prune`, which would
+        # also delete other projects' containers, networks and build cache.
         echo "🧹 Cleaning up..."
-        docker compose down
-        docker system prune -f
+        docker compose down --rmi local --volumes --remove-orphans
         echo "✅ Cleanup complete!"
         ;;
-    *)
+    "help"|"-h"|"--help")
         echo "Usage: $0 {deploy|start|stop|restart|logs|status|update|clean}"
-        echo ""
-        echo "Commands:"
-        echo "  deploy  - Build and deploy the service (default)"
-        echo "  start   - Start the service"
-        echo "  stop    - Stop the service"
-        echo "  restart - Restart the service"
-        echo "  logs    - Show service logs"
-        echo "  status  - Show service status and health"
-        echo "  update  - Pull latest code and update service"
-        echo "  clean   - Stop service and clean up Docker resources"
+        ;;
+    *)
+        echo "Usage: $0 {deploy|start|stop|restart|logs|status|update|clean}" >&2
         exit 1
         ;;
 esac

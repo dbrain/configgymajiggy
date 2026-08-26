@@ -9,6 +9,12 @@ use std::time::Duration;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
+/// Headroom between the longest long poll and the transport timeout that
+/// guards it. The timeout's clock starts at request arrival, the handler's
+/// deadline only once it runs, so an equal budget always cancels the handler
+/// before it can answer.
+const LONG_POLL_GRACE: Duration = Duration::from_secs(5);
+
 use crate::error::ApiError;
 use crate::pin::{Namespace, Pin};
 use crate::store::{Allocation, Deposit, Payload, PinKey, PinStore, Poll};
@@ -183,7 +189,9 @@ pub fn router(store: PinStore) -> Router {
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            config.request_timeout,
+            config
+                .request_timeout
+                .max(config.max_long_poll + LONG_POLL_GRACE),
         ))
         .layer(cors(&config.allowed_origins))
         .with_state(store)

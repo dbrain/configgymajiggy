@@ -468,3 +468,26 @@ async fn long_poll_is_capped_and_returns_empty_on_timeout() {
         "wait must be clamped to max_long_poll"
     );
 }
+
+#[tokio::test]
+async fn a_long_poll_that_runs_its_full_wait_is_not_cut_off_by_the_request_timeout() {
+    // The shipped defaults give REQUEST_TIMEOUT_SECS and MAX_LONG_POLL_SECS the
+    // same budget, but the transport timeout's clock starts before the handler
+    // computes its deadline - so an equal budget always cancels the handler
+    // first and the caller gets a 408 after waiting out the whole poll.
+    let (server, _store) = server_with(Config {
+        max_long_poll: std::time::Duration::from_millis(200),
+        request_timeout: std::time::Duration::from_millis(200),
+        ..Config::default()
+    });
+    let pin = allocate(&server, "fullwait").await;
+
+    let response = server.post(&format!("/pin/fullwait/{pin}?wait=600")).await;
+
+    assert_eq!(
+        response.status_code(),
+        200,
+        "a long poll that reaches its cap must answer, not time out"
+    );
+    assert!(response.json::<PinResponse>().result.is_none());
+}

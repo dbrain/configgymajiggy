@@ -1,421 +1,234 @@
-# Configgymajiggy - PIN-based Temporary Data Exchange Service
+# Configgymajiggy
 
 > ⚠️ **Warning**: Do not use this. I only made it public so I could hurt myself and deploy it to some hacky cloud instance easier, previously I was covering my shame by making it private.
 
-Configgymajiggy is a lightweight Rust web service that provides temporary data exchange using short PIN codes. It's designed for scenarios where you need to briefly share data between systems without permanent storage.
+A small Rust service for handing data between two systems using a short PIN. One side asks for a PIN, the other side PUTs a JSON payload against it, and the first side polls until it comes back. Everything lives in memory and expires after 10 minutes.
 
-## Features
+## How it works
 
-- **Short PIN Generation**: Creates unique 4-character alphanumeric PINs
-- **Namespace Support**: Organize PINs by namespace to avoid conflicts
-- **Automatic Cleanup**: Removes stale PINs after 10 minutes
-- **JSON Data Storage**: Store arbitrary JSON payloads up to 3KB
-- **Thread-Safe**: Concurrent access with evmap for high performance
-- **Health Monitoring**: Built-in health check endpoint
+```
+Receiver                          Service                       Sender
+   │  POST /pin/myapp                │                             │
+   │────────────────────────────────>│                             │
+   │  {"pin":"A7X9","result":null}   │                             │
+   │<────────────────────────────────│    PUT /pin/myapp/A7X9      │
+   │                                 │<────────────────────────────│
+   │  POST /pin/myapp/A7X9           │            202 Thanks!      │
+   │────────────────────────────────>│────────────────────────────>│
+   │  {"pin":"A7X9","result":{...}}  │
+   │<────────────────────────────────│   ← payload delivered, PIN destroyed
+```
 
-## Quick Start
+A payload is delivered to exactly one poller. Reading it destroys the PIN.
 
-### Prerequisites
+## Deploying
 
-- Rust 1.70+ (due to dependency requirements)
-- Cargo package manager
-
-### Installation & Running
+Requires Docker with the Compose v2 plugin (`docker compose`, not the old `docker-compose` binary).
 
 ```bash
-# Clone the repository
 git clone <repository-url>
 cd configgy
 
-# Run the service
-cargo run
-
-# Or build and run the binary
-cargo build --release
-./target/release/biboop
+cp .env.example .env   # optional, see Configuration
+docker compose up -d --build
 ```
 
-The service will start on `http://0.0.0.0:8080`
+That builds the image and starts the service on port 8080 with `restart: unless-stopped`, so it comes back on reboot.
 
-### Docker Deployment (Recommended)
-
-The easiest way to deploy Configgymajiggy to a server is using Docker Compose:
+Verify it:
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd configgy
-
-# Deploy with Docker Compose (one command!)
-docker-compose up -d
-
-# Check service status
-docker-compose ps
-docker-compose logs configgymajiggy
+curl http://localhost:8080/health          # -> All good.
+docker compose ps                          # STATUS should read "healthy"
 ```
 
-The service will be available on port 8080 and will automatically restart if the server reboots.
+The container has a built-in healthcheck, so `docker compose ps` reports real service health rather than just "the process is running". It takes a few seconds after startup to flip from `starting` to `healthy`.
 
-#### Custom Port Deployment
-
-To expose on a different port (e.g., port 3000):
+### Redeploying
 
 ```bash
-# Edit docker-compose.yml and change ports section:
-# ports:
-#   - "3000:8080"  # External:Internal
-
-docker-compose up -d
-```
-
-#### Production Deployment
-
-For production use:
-
-```bash
-# Copy and customize environment file
-cp .env.example .env
-nano .env  # Set RUST_LOG=info or warn for production
-
-# Deploy
-docker-compose up -d
-
-# Monitor logs
-docker-compose logs -f configgymajiggy
-```
-
-#### Management Commands
-
-```bash
-# Start service
-docker-compose up -d
-
-# Stop service
-docker-compose down
-
-# Update service
 git pull
-docker-compose build
-docker-compose up -d
-
-# View logs
-docker-compose logs configgymajiggy
-
-# Check health
-curl http://localhost:8080/health
+docker compose up -d --build
 ```
 
-## API Reference
+Compose rebuilds and replaces the container only if something changed. The Dockerfile caches the dependency build separately from your source, so source-only changes rebuild in seconds.
 
-### Base URL
+### Day-to-day
+
+```bash
+docker compose logs -f configgymajiggy   # tail logs
+docker compose restart                   # restart
+docker compose down                      # stop and remove
+docker compose down && docker compose up -d --build   # force full recreate
 ```
-http://localhost:8080
+
+`./deploy.sh` wraps these same commands (`deploy`, `start`, `stop`, `restart`, `logs`, `status`, `update`, `clean`) if you prefer.
+
+## Configuration
+
+Copy `.env.example` to `.env`. Compose reads it automatically; both are optional and sensible defaults apply.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RUST_LOG` | `info` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+| `EXTERNAL_PORT` | `8080` | Host port to publish on. The container always listens on 8080 internally. |
+
+To serve on port 3000 instead:
+
+```bash
+echo "EXTERNAL_PORT=3000" >> .env
+docker compose up -d
 ```
 
-### Endpoints
+`BIND_ADDRESS` is also honoured by the binary, but leave it alone under Docker — the container must bind `0.0.0.0:8080` for port publishing to work. It's there for running outside a container.
 
-#### 1. Generate PIN
-**POST** `/pin/{namespace}`
+These are compile-time constants in `src/main.rs`:
 
-Generates a new unique PIN in the specified namespace.
+| Constant | Value |
+|---|---|
+| `PIN_LENGTH` | 4 characters |
+| `MAX_RESULT_SIZE_BYTES` | 3000 bytes |
+| `STALE_AGE_MINS` | 10 minutes |
+| `CLEANUP_INTERVAL` | 10 seconds |
 
-**Example:**
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/pin/{namespace}` | Allocate a new PIN |
+| `POST` | `/pin/{namespace}/{pin}` | Poll a PIN; consumes the payload if present |
+| `PUT` | `/pin/{namespace}/{pin}` | Submit a payload to an existing PIN |
+| `GET` | `/health` | Health check |
+
+Namespaces are just a key prefix — the same PIN string in two namespaces refers to two unrelated slots. No setup needed; use any string.
+
+### Allocate a PIN
+
 ```bash
 curl -X POST http://localhost:8080/pin/myapp
+# 200 {"pin":"A7X9","result":null}
 ```
 
-**Response:**
-```json
-{
-  "pin": "A7X9",
-  "result": null
-}
-```
+Returns `429` if it can't find a free PIN in 10 attempts.
 
-#### 2. Poll PIN
-**POST** `/pin/{namespace}/{pin}`
+### Poll a PIN
 
-Checks if data has been submitted to a PIN. Returns the data if available, or generates a new PIN if the current one is empty.
-
-**Example:**
 ```bash
 curl -X POST http://localhost:8080/pin/myapp/A7X9
 ```
 
-**Response (no data yet):**
-```json
-{
-  "pin": "B2Y4",
-  "result": null
-}
-```
+Always `200`, but there are three cases to distinguish, and they're easy to confuse:
 
-**Response (with data):**
-```json
-{
-  "pin": "A7X9",
-  "result": {
-    "message": "Hello, World!",
-    "timestamp": "2023-12-07T10:30:00Z"
-  }
-}
-```
+| Situation | Response | What it means |
+|---|---|---|
+| PIN exists, has a payload | `{"pin":"A7X9","result":{...}}` | Delivered. The PIN is now destroyed. |
+| PIN exists, still empty | `{"pin":"A7X9","result":null}` | Same PIN echoed back. Keep polling it. |
+| PIN unknown or expired | `{"pin":"B2Y4","result":null}` | **A different PIN.** Your old one is gone; start over with this one. |
 
-#### 3. Submit Data to PIN
-**PUT** `/pin/{namespace}/{pin}`
+So a client loop must re-read `pin` from every response rather than assuming it's unchanged — that's how expiry is signalled.
 
-Submits JSON data to an existing PIN.
+### Submit a payload
 
-**Example:**
 ```bash
 curl -X PUT http://localhost:8080/pin/myapp/A7X9 \
   -H "Content-Type: application/json" \
-  -d '{"message": "Hello, World!", "timestamp": "2023-12-07T10:30:00Z"}'
+  -d '{"message": "Hello, World!", "n": 42}'
+# 202 Thanks!
 ```
 
-**Response:**
-```
-Thanks!
-```
+The body must be a **JSON object**. Arrays and scalars are rejected with `422`. Submitting also resets the PIN's 10-minute expiry clock.
 
-#### 4. Health Check
-**GET** `/health`
+### Health
 
-Returns the service health status.
-
-**Example:**
 ```bash
 curl http://localhost:8080/health
+# 200 All good.
 ```
 
-**Response:**
-```
-All good.
-```
+### Status codes
 
-## Usage Patterns
+| Code | Meaning |
+|---|---|
+| `200` | PIN allocated, or poll answered |
+| `202` | Payload accepted |
+| `404` | PIN doesn't exist or expired (on `PUT`) |
+| `413` | Payload over 3000 bytes |
+| `415` | Missing `Content-Type: application/json` |
+| `422` | Body wasn't a JSON object |
+| `429` | Couldn't allocate a free PIN |
 
-### 1. Simple Data Exchange
-
-**Step 1: Generate a PIN**
-```bash
-curl -X POST http://localhost:8080/pin/chat
-# Response: {"pin": "X7Z2", "result": null}
-```
-
-**Step 2: Share the PIN with recipient**
-Give the PIN "X7Z2" to the person who will send data.
-
-**Step 3: Sender submits data**
-```bash
-curl -X PUT http://localhost:8080/pin/chat/X7Z2 \
-  -H "Content-Type: application/json" \
-  -d '{"message": "Secret message", "from": "alice"}'
-```
-
-**Step 4: Receiver polls for data**
-```bash
-curl -X POST http://localhost:8080/pin/chat/X7Z2
-# Response: {"pin": "X7Z2", "result": {"message": "Secret message", "from": "alice"}}
-```
-
-### 2. Device Pairing
-
-**Use Case**: Pair two devices by exchanging configuration data.
-
-```bash
-# Device A generates PIN
-curl -X POST http://localhost:8080/pin/pairing
-# Response: {"pin": "M4K8", "result": null}
-
-# Device A submits its config
-curl -X PUT http://localhost:8080/pin/pairing/M4K8 \
-  -H "Content-Type: application/json" \
-  -d '{"device_id": "device-a", "ip": "192.168.1.100", "port": 8081}'
-
-# Device B retrieves the config using the PIN
-curl -X POST http://localhost:8080/pin/pairing/M4K8
-# Response: {"pin": "M4K8", "result": {"device_id": "device-a", "ip": "192.168.1.100", "port": 8081}}
-```
-
-### 3. Continuous Polling
-
-For applications that need to wait for data:
+## Example: polling client
 
 ```bash
 #!/bin/bash
 NAMESPACE="myapp"
-PIN=""
 
-# Get initial PIN
-RESPONSE=$(curl -s -X POST http://localhost:8080/pin/$NAMESPACE)
-PIN=$(echo $RESPONSE | jq -r '.pin')
+PIN=$(curl -s -X POST "http://localhost:8080/pin/$NAMESPACE" | jq -r '.pin')
 echo "Waiting for data on PIN: $PIN"
 
-# Poll until data arrives
 while true; do
-    RESPONSE=$(curl -s -X POST http://localhost:8080/pin/$NAMESPACE/$PIN)
-    RESULT=$(echo $RESPONSE | jq -r '.result')
-    
+    RESPONSE=$(curl -s -X POST "http://localhost:8080/pin/$NAMESPACE/$PIN")
+    RESULT=$(jq -r '.result' <<< "$RESPONSE")
+
     if [ "$RESULT" != "null" ]; then
         echo "Data received: $RESULT"
         break
     fi
-    
-    # Update PIN if service returned a new one
-    NEW_PIN=$(echo $RESPONSE | jq -r '.pin')
+
+    # The service hands back a new PIN when the old one expires.
+    NEW_PIN=$(jq -r '.pin' <<< "$RESPONSE")
     if [ "$NEW_PIN" != "$PIN" ]; then
         PIN=$NEW_PIN
-        echo "New PIN: $PIN"
+        echo "PIN expired, now using: $PIN"
     fi
-    
+
     sleep 2
 done
 ```
 
-## Configuration
+## Local development
 
-### Environment Variables
+Needs Rust 1.85+ (edition 2024).
 
-The service uses dotenv for configuration. Create a `.env` file:
-
-```env
-# Logging level (error, warn, info, debug, trace)
-RUST_LOG=info
-
-# Server bind address (default: 0.0.0.0:8080)
-# BIND_ADDRESS=127.0.0.1:3000
-```
-
-### Service Configuration
-
-Key parameters (hardcoded in current version):
-
-- **PIN Length**: 4 characters
-- **Max Payload Size**: 3,000 bytes
-- **PIN Expiry**: 10 minutes
-- **Cleanup Interval**: 10 seconds
-- **Bind Address**: 0.0.0.0:8080
-
-## Error Handling
-
-### Common HTTP Status Codes
-
-- **200 OK**: Successful PIN generation or data retrieval
-- **202 Accepted**: Data successfully submitted to PIN
-- **404 Not Found**: PIN doesn't exist or has expired
-- **413 Payload Too Large**: Submitted data exceeds 3KB limit
-- **429 Too Many Requests**: Cannot generate unique PIN (try again)
-
-### Error Responses
-
-**PIN Not Found:**
 ```bash
-curl -X PUT http://localhost:8080/pin/test/INVALID
-# Response: "Pin not found." (404)
+cargo run                              # serves on 0.0.0.0:8080
+BIND_ADDRESS=127.0.0.1:3000 cargo run  # or somewhere else
+
+cargo test          # 19 unit + integration tests
+cargo clippy --all-targets
+cargo fmt
 ```
 
-**Payload Too Large:**
-```bash
-curl -X PUT http://localhost:8080/pin/test/A1B2 -d '{"data": "very large payload..."}'
-# Response: "Payload too large." (413)
-```
+### Layout
 
-## Development
-
-### Running Tests
-```bash
-# Run all tests
-cargo test
-
-# Run with output
-cargo test -- --nocapture
-
-# Run specific test
-cargo test test_pin_item_creation
-
-# Run integration tests only
-cargo test test_health_endpoint
-```
-
-### Code Structure
-
-- `src/main.rs`: Main application with all endpoints and logic
-- `scripts/make_amd64.sh`: Docker build script
-- `Dockerfile-amd64`: Multi-stage Docker build
-- `scripts/configgymajiggy.service`: Systemd service file
+| File | Purpose |
+|---|---|
+| `src/main.rs` | The whole service: handlers, storage, cleanup, tests |
+| `Dockerfile` | Multi-stage build; dependency layer cached separately from source |
+| `docker-compose.yml` | Deployment definition |
+| `deploy.sh` | Convenience wrapper around `docker compose` |
 
 ### Dependencies
 
-Key dependencies and their purposes:
-
-- `axum`: Modern HTTP server framework built on hyper and tower (v0.8)
-- `evmap`: Lock-free concurrent map for high-performance storage (v10.0)
-- `serde`: JSON serialization/deserialization (v1.0)
-- `chrono`: Date/time handling for expiry (v0.4)
-- `clokwerk`: Background task scheduling (v0.4)
-- `rand`: PIN generation (v0.9 with updated API)
-- `tower-http`: HTTP middleware and utilities (v0.6)
-- `dotenvy`: Environment variable loading (modern dotenv replacement)
-
-## Production Deployment
-
-### Systemd Service
-
-Use the provided service file:
-
-```bash
-# Copy service file
-sudo cp scripts/configgymajiggy.service /etc/systemd/system/
-
-# Enable and start
-sudo systemctl enable configgymajiggy
-sudo systemctl start configgymajiggy
-
-# Check status
-sudo systemctl status configgymajiggy
-```
-
-### Monitoring
-
-Monitor the service health:
-
-```bash
-# Health check
-curl http://localhost:8080/health
-
-# Check logs
-sudo journalctl -u configgymajiggy -f
-```
-
-### Security Considerations
-
-- No authentication mechanism - deploy behind a proxy with auth if needed
-- PINs are short and may be guessable - use appropriate namespacing
-- Data is stored in memory only - lost on restart
-- No rate limiting - consider adding reverse proxy with rate limiting
+| Crate | Purpose |
+|---|---|
+| `axum` | HTTP server |
+| `dashmap` | Sharded concurrent map holding the PINs |
+| `tokio` | Async runtime; also drives the cleanup interval |
+| `serde` / `serde_json` | JSON handling |
+| `chrono` | Expiry timestamps |
+| `rand` | PIN generation |
+| `tower-http` | CORS |
+| `env_logger` / `log` | Logging |
+| `dotenvy` | Loads `.env` when running outside Docker |
+| `anyhow` | Error handling in `main` |
 
 ## Limitations
 
-- **Memory Only**: All data is lost on service restart
-- **No Persistence**: PINs and data are not saved to disk
-- **No Authentication**: Anyone can access any PIN if they guess it
-- **No Rate Limiting**: No built-in protection against abuse
-- **Fixed Configuration**: Key parameters are hardcoded
+- **In memory only.** A restart drops every PIN and payload. `docker compose up -d --build` therefore loses in-flight exchanges.
+- **No authentication.** Anyone who reaches the port can allocate PINs and read any PIN they guess.
+- **PINs are short.** 4 characters is roughly 1.6M combinations, and a namespace with many live PINs is brute-forceable. Use unguessable namespaces if that matters.
+- **No rate limiting.** Put it behind a reverse proxy if it's exposed.
+- **CORS is fully permissive**, so any origin can call it from a browser.
 
-## Recent Improvements
-
-✅ **Latest Framework**: Migrated to Axum 0.8 with modern path parameter syntax (`{param}`)  
-✅ **Dependency Updates**: All dependencies updated to latest versions (rand 0.9, tower 0.5, etc.)  
-✅ **Modern Environment**: Replaced dotenv with dotenvy for better maintenance  
-✅ **Optimized Features**: Refined tokio features for smaller binary size  
-✅ **All Tests Passing**: 14 comprehensive tests covering unit and integration scenarios  
-✅ **Rust 2021**: Updated to latest Rust edition with modern async patterns
-
-## License
-
-[Add your license information here]
-
-## Contributing
-
-[Add contribution guidelines here]
+Deploy it behind a proxy that terminates TLS and adds auth if it's going anywhere public.

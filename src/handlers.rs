@@ -1,16 +1,17 @@
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 
 use crate::error::ApiError;
 use crate::pin::{Namespace, Pin};
-use crate::store::{Allocation, Deposit, Payload, PinKey, PinStore};
+use crate::store::{Allocation, Deposit, Payload, PinKey, PinStore, Poll};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PinResponse {
@@ -24,7 +25,8 @@ fn allocate(store: &PinStore, namespace: &Namespace) -> Result<PinResponse, ApiE
             pin: pin.to_string(),
             result: None,
         }),
-        Allocation::Unavailable => Err(ApiError::NoCapacity),
+        Allocation::AtCapacity => Err(ApiError::NoCapacity),
+        Allocation::NamespaceFull => Err(ApiError::NamespaceFull),
     }
 }
 
@@ -42,25 +44,65 @@ async fn create_pin(
     allocate(&store, &Namespace::parse(&namespace)?).map(Json)
 }
 
+#[derive(Deserialize)]
+pub struct PollParams {
+    /// Seconds to hold the request open waiting for a payload. Clamped to
+    /// `MAX_LONG_POLL_SECS`; 0 (the default) returns immediately.
+    #[serde(default)]
+    wait: u64,
+}
+
+fn pending(key: &PinKey) -> Json<PinResponse> {
+    Json(PinResponse {
+        pin: key.pin.to_string(),
+        result: None,
+    })
+}
+
 async fn poll_pin(
     Path((namespace, pin)): Path<(String, String)>,
+    Query(params): Query<PollParams>,
     State(store): State<PinStore>,
 ) -> Result<Json<PinResponse>, ApiError> {
     let key = key(&store, &namespace, &pin)?;
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(params.wait).min(store.config().max_long_poll);
 
-    // An unknown pin is reported as missing rather than silently replaced: the
-    // old behaviour made probing an allocation primitive and leaked which pins
-    // exist.
-    match store.poll(&key) {
-        crate::store::Poll::Unknown => Err(ApiError::PinNotFound),
-        crate::store::Poll::Pending => Ok(Json(PinResponse {
-            pin: key.pin.to_string(),
-            result: None,
-        })),
-        crate::store::Poll::Delivered(payload) => Ok(Json(PinResponse {
-            pin: key.pin.to_string(),
-            result: Some(payload),
-        })),
+    loop {
+        // Register interest *before* reading the slot, so a payload landing
+        // between the read and the wait cannot be missed.
+        let arrival = store.arrival(&key);
+        let notified = arrival.as_ref().map(|n| n.notified());
+        tokio::pin!(notified);
+        if let Some(notified) = notified.as_mut().as_pin_mut() {
+            notified.enable();
+        }
+
+        // An unknown pin is reported as missing rather than silently replaced:
+        // the old behaviour made probing an allocation primitive and leaked
+        // which pins exist.
+        match store.poll(&key) {
+            Poll::Unknown => return Err(ApiError::PinNotFound),
+            Poll::Throttled => return Err(ApiError::TooManyGuesses),
+            Poll::Delivered(payload) => {
+                return Ok(Json(PinResponse {
+                    pin: key.pin.to_string(),
+                    result: Some(payload),
+                }));
+            }
+            Poll::Pending => {}
+        }
+
+        let Some(notified) = notified.as_mut().as_pin_mut() else {
+            return Ok(pending(&key));
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(pending(&key));
+        }
+
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return Ok(pending(&key));
+        }
     }
 }
 
@@ -82,11 +124,23 @@ async fn respond_to_pin(
         Deposit::Accepted => Ok((StatusCode::ACCEPTED, "Thanks!")),
         Deposit::AlreadyPopulated => Err(ApiError::PinAlreadyPopulated),
         Deposit::Unknown => Err(ApiError::PinNotFound),
+        Deposit::Throttled => Err(ApiError::TooManyGuesses),
     }
 }
 
+/// Liveness: the process is up and serving. Deliberately does no work.
 async fn health() -> impl IntoResponse {
     "All good."
+}
+
+/// Readiness: also asserts the expiry sweeper is still running. Without this a
+/// dead sweeper looks healthy right up until memory fills.
+async fn ready(State(store): State<PinStore>) -> Result<impl IntoResponse, ApiError> {
+    if store.is_ready() {
+        Ok("Ready.")
+    } else {
+        Err(ApiError::NotReady)
+    }
 }
 
 fn cors(allowed_origins: &[String]) -> CorsLayer {
@@ -111,6 +165,7 @@ pub fn router(store: PinStore) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route(
             "/pin/{namespace}",
             // These read no body; without a limit they would accept axum's 2 MB default.

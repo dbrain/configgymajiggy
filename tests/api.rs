@@ -306,3 +306,133 @@ async fn health_is_plain_and_cheap() {
     assert_eq!(response.text(), "All good.");
     assert_eq!(store.len(), 0, "health must not touch state");
 }
+
+#[tokio::test]
+async fn repeated_wrong_guesses_get_throttled() {
+    let (server, _store) = server_with(Config {
+        max_probe_misses: 5,
+        ..Config::default()
+    });
+
+    // A brute-forcer sweeping the keyspace only gets a handful of tries.
+    for _ in 0..5 {
+        assert_eq!(server.post("/pin/guessy/ZZZZ").await.status_code(), 404);
+    }
+
+    let throttled = server.post("/pin/guessy/YYYY").await;
+    assert_eq!(
+        throttled.status_code(),
+        429,
+        "guessing must be rate limited"
+    );
+    assert!(throttled.headers().contains_key("retry-after"));
+}
+
+#[tokio::test]
+async fn throttling_is_scoped_to_the_guessed_namespace() {
+    let (server, _store) = server_with(Config {
+        max_probe_misses: 3,
+        ..Config::default()
+    });
+
+    for _ in 0..4 {
+        server.post("/pin/noisy/ZZZZ").await;
+    }
+    assert_eq!(server.post("/pin/noisy/ZZZZ").await.status_code(), 429);
+
+    // An unrelated tenant must be unaffected.
+    assert_eq!(server.post("/pin/quiet").await.status_code(), 200);
+    assert_eq!(server.post("/pin/quiet/ZZZZ").await.status_code(), 404);
+}
+
+#[tokio::test]
+async fn one_namespace_cannot_exhaust_the_service() {
+    let (server, _store) = server_with(Config {
+        max_pins_per_namespace: 3,
+        ..Config::default()
+    });
+
+    for _ in 0..3 {
+        assert_eq!(server.post("/pin/greedy").await.status_code(), 200);
+    }
+    assert_eq!(
+        server.post("/pin/greedy").await.status_code(),
+        503,
+        "a namespace must not exceed its quota"
+    );
+
+    // Other namespaces keep working.
+    assert_eq!(server.post("/pin/polite").await.status_code(), 200);
+}
+
+#[tokio::test]
+async fn readiness_reports_sweeper_health() {
+    let (fresh, _store) = server();
+    assert_eq!(fresh.get("/ready").await.status_code(), 200);
+
+    // No sweeper task runs in the test harness, so a short interval makes the
+    // sweep overdue on its own - exactly what a dead sweeper looks like.
+    let (stalled, _store) = server_with(Config {
+        cleanup_interval: std::time::Duration::from_millis(10),
+        ..Config::default()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+    assert_eq!(
+        stalled.get("/ready").await.status_code(),
+        503,
+        "an overdue sweep must fail readiness"
+    );
+    assert_eq!(
+        stalled.get("/health").await.status_code(),
+        200,
+        "liveness stays up - the process is still serving"
+    );
+}
+
+#[tokio::test]
+async fn long_poll_returns_as_soon_as_the_payload_lands() {
+    let (server, _store) = server();
+    let pin = allocate(&server, "longpoll").await;
+
+    let started = std::time::Instant::now();
+
+    let (polled, _) = tokio::join!(
+        server.post(&format!("/pin/longpoll/{pin}?wait=10")),
+        async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            server
+                .put(&format!("/pin/longpoll/{pin}"))
+                .json(&json!({"late": true}))
+                .await
+        }
+    );
+
+    assert!(
+        polled.json::<PinResponse>().result.is_some(),
+        "long poll should deliver the payload"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "long poll should wake on the write, not time out"
+    );
+}
+
+#[tokio::test]
+async fn long_poll_is_capped_and_returns_empty_on_timeout() {
+    let (server, _store) = server_with(Config {
+        max_long_poll: std::time::Duration::from_millis(150),
+        ..Config::default()
+    });
+    let pin = allocate(&server, "capped").await;
+
+    let started = std::time::Instant::now();
+    let response = server.post(&format!("/pin/capped/{pin}?wait=600")).await;
+
+    assert_eq!(response.status_code(), 200);
+    assert!(response.json::<PinResponse>().result.is_none());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "wait must be clamped to max_long_poll"
+    );
+}

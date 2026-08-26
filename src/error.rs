@@ -15,6 +15,9 @@ pub enum ApiError {
     PayloadTooLarge(usize),
     MalformedPayload,
     NoCapacity,
+    NamespaceFull,
+    TooManyGuesses,
+    NotReady,
 }
 
 #[derive(Serialize)]
@@ -30,7 +33,10 @@ impl ApiError {
             Self::PinAlreadyPopulated => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::MalformedPayload => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::NoCapacity => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoCapacity | Self::NamespaceFull | Self::NotReady => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::TooManyGuesses => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 
@@ -45,6 +51,9 @@ impl ApiError {
             Self::PayloadTooLarge(limit) => format!("Payload exceeds {limit} bytes."),
             Self::MalformedPayload => "Body must be a JSON object.".to_string(),
             Self::NoCapacity => "No pin available right now.".to_string(),
+            Self::NamespaceFull => "This namespace has too many live pins.".to_string(),
+            Self::TooManyGuesses => "Too many unknown pins requested; slow down.".to_string(),
+            Self::NotReady => "Service is not ready.".to_string(),
         }
     }
 }
@@ -65,7 +74,8 @@ impl IntoResponse for ApiError {
         });
 
         match self {
-            Self::NoCapacity => (
+            // Every backpressure case tells the caller when to come back.
+            Self::NoCapacity | Self::NamespaceFull | Self::TooManyGuesses | Self::NotReady => (
                 self.status(),
                 [(header::RETRY_AFTER, RETRY_AFTER_SECS)],
                 body,
@@ -90,6 +100,9 @@ mod tests {
             (ApiError::PayloadTooLarge(3000), 413),
             (ApiError::MalformedPayload, 422),
             (ApiError::NoCapacity, 503),
+            (ApiError::NamespaceFull, 503),
+            (ApiError::TooManyGuesses, 429),
+            (ApiError::NotReady, 503),
         ];
         for (error, expected) in cases {
             assert_eq!(error.status().as_u16(), expected, "{error:?}");
@@ -97,12 +110,20 @@ mod tests {
     }
 
     #[test]
-    fn capacity_errors_carry_retry_after() {
-        let response = ApiError::NoCapacity.into_response();
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER).unwrap(),
-            RETRY_AFTER_SECS
-        );
+    fn backpressure_errors_carry_retry_after() {
+        for error in [
+            ApiError::NoCapacity,
+            ApiError::NamespaceFull,
+            ApiError::TooManyGuesses,
+            ApiError::NotReady,
+        ] {
+            let response = error.clone().into_response();
+            assert_eq!(
+                response.headers().get(header::RETRY_AFTER),
+                Some(&header::HeaderValue::from_static(RETRY_AFTER_SECS)),
+                "{error:?} should tell the caller when to retry"
+            );
+        }
     }
 
     #[test]

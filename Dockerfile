@@ -1,5 +1,8 @@
 # Multi-stage build for optimized production image
-FROM rust:1.98-slim-bookworm AS builder
+# Bases are pinned by digest so an identical source revision always produces an
+# identical image. Refresh with:
+#   docker manifest inspect rust:1.98-slim-bookworm -v | jq -r '.[0].Descriptor.digest'
+FROM rust:1.98-slim-bookworm@sha256:af0579d28b9a7ec5251aaafcb0c0a23dcde5c97065112aae0cc3abeda42d5394 AS builder
 
 WORKDIR /usr/src/app
 
@@ -20,7 +23,7 @@ COPY src ./src
 RUN find src -type f -exec touch {} + && cargo build --release --locked
 
 # Production stage
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:5ae3c39ebd15e229dcedd5cee596b2497182493d41ff162e824ba13fc1b2b867
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

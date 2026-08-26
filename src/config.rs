@@ -10,6 +10,14 @@ pub const DEFAULT_STALE_AGE_MINS: u64 = 10;
 pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 10;
 pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MAX_PINS_PER_NAMESPACE: usize = 1000;
+pub const DEFAULT_MAX_PROBE_MISSES: u32 = 60;
+pub const DEFAULT_PROBE_WINDOW_SECS: u64 = 60;
+pub const DEFAULT_MAX_LONG_POLL_SECS: u64 = 30;
+
+/// A sweep is overdue after this many missed cleanup intervals; readiness fails
+/// past it so a dead sweeper cannot masquerade as a healthy service.
+pub const SWEEP_OVERDUE_INTERVALS: u32 = 3;
 
 /// Upper bound on `PIN_LENGTH`. Guards against a typo turning every allocation
 /// into a multi-kilobyte key.
@@ -25,6 +33,10 @@ pub struct Config {
     pub max_entries: usize,
     pub request_timeout: Duration,
     pub allowed_origins: Vec<String>,
+    pub max_pins_per_namespace: usize,
+    pub max_probe_misses: u32,
+    pub probe_window: Duration,
+    pub max_long_poll: Duration,
 }
 
 pub struct ConfigError {
@@ -59,6 +71,10 @@ impl Default for Config {
             max_entries: DEFAULT_MAX_ENTRIES,
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
             allowed_origins: Vec::new(),
+            max_pins_per_namespace: DEFAULT_MAX_PINS_PER_NAMESPACE,
+            max_probe_misses: DEFAULT_MAX_PROBE_MISSES,
+            probe_window: Duration::from_secs(DEFAULT_PROBE_WINDOW_SECS),
+            max_long_poll: Duration::from_secs(DEFAULT_MAX_LONG_POLL_SECS),
         }
     }
 }
@@ -89,13 +105,31 @@ impl Config {
                 .filter(|origin| !origin.is_empty())
                 .map(str::to_string)
                 .collect(),
+            max_pins_per_namespace: parse(
+                "MAX_PINS_PER_NAMESPACE",
+                DEFAULT_MAX_PINS_PER_NAMESPACE,
+            )?,
+            max_probe_misses: parse("MAX_PROBE_MISSES", DEFAULT_MAX_PROBE_MISSES)?,
+            probe_window: Duration::from_secs(parse(
+                "PROBE_WINDOW_SECS",
+                DEFAULT_PROBE_WINDOW_SECS,
+            )?),
+            max_long_poll: Duration::from_secs(parse(
+                "MAX_LONG_POLL_SECS",
+                DEFAULT_MAX_LONG_POLL_SECS,
+            )?),
         };
         config.validate()?;
         Ok(config)
     }
 
+    /// A sweep older than this means the cleanup task has stopped running.
+    pub fn sweep_deadline(&self) -> Duration {
+        self.cleanup_interval * SWEEP_OVERDUE_INTERVALS
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
-        let checks: [(&'static str, bool, &str); 6] = [
+        let checks: [(&'static str, bool, &str); 9] = [
             (
                 "PIN_LENGTH",
                 (1..=PIN_LENGTH_LIMIT).contains(&self.pin_length),
@@ -124,6 +158,21 @@ impl Config {
             (
                 "REQUEST_TIMEOUT_SECS",
                 !self.request_timeout.is_zero(),
+                "must be greater than zero",
+            ),
+            (
+                "MAX_PINS_PER_NAMESPACE",
+                self.max_pins_per_namespace > 0,
+                "must be greater than zero",
+            ),
+            (
+                "MAX_PROBE_MISSES",
+                self.max_probe_misses > 0,
+                "must be greater than zero",
+            ),
+            (
+                "PROBE_WINDOW_SECS",
+                !self.probe_window.is_zero(),
                 "must be greater than zero",
             ),
         ];

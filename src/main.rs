@@ -1,5 +1,5 @@
 use configgymajiggy::{Config, PinStore, router};
-use log::{debug, info};
+use log::{debug, error, info};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,24 +20,7 @@ async fn main() -> Result<(), BoxError> {
 
     let store = PinStore::new(Arc::clone(&config));
 
-    let sweeper = tokio::spawn({
-        let store = store.clone();
-        let interval = config.cleanup_interval;
-        async move {
-            let mut ticker = tokio::time::interval(interval);
-            // Burst would turn one slow sweep into back-to-back full-map scans.
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                let evicted = store.sweep();
-                if evicted > 0 {
-                    // Never the key: it carries the namespace, which is this
-                    // service's only access control.
-                    debug!("swept {evicted} stale pins");
-                }
-            }
-        }
-    });
+    let sweeper = tokio::spawn(supervised_sweeper(store.clone(), config.cleanup_interval));
 
     let listener = tokio::net::TcpListener::bind(&config.bind_address).await?;
     info!("Server running on http://{}", config.bind_address);
@@ -49,6 +32,37 @@ async fn main() -> Result<(), BoxError> {
     sweeper.abort();
     info!("Shutdown complete");
     Ok(())
+}
+
+/// Runs the expiry sweep forever, restarting it if it ever panics. Losing this
+/// task silently would let memory grow to `MAX_ENTRIES` and stay there while the
+/// service still reported healthy.
+async fn supervised_sweeper(store: PinStore, interval: Duration) {
+    loop {
+        let worker = tokio::spawn(sweep_loop(store.clone(), interval));
+
+        match worker.await {
+            Ok(()) => return,
+            Err(e) if e.is_cancelled() => return,
+            Err(e) => error!("expiry sweeper died ({e}); restarting"),
+        }
+    }
+}
+
+async fn sweep_loop(store: PinStore, interval: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    // Burst would turn one slow sweep into back-to-back full-map scans.
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+        let evicted = store.sweep();
+        if evicted > 0 {
+            // Never the key: it carries the namespace, which is this service's
+            // only access control.
+            debug!("swept {evicted} stale pins");
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -75,14 +89,16 @@ async fn shutdown_signal() {
     }
 }
 
-/// Probes `/health` over a raw socket so the runtime image does not need curl.
+/// Probes `/ready` over a raw socket so the runtime image does not need curl.
+/// Readiness rather than liveness, so Docker restarts a container whose expiry
+/// sweeper has died instead of leaving it to fill up.
 async fn health_check(config: &Config) -> Result<(), BoxError> {
     let port = config.port().ok_or("BIND_ADDRESS has no port")?;
 
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
         stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .await?;
 
         let mut response = vec![0u8; 64];

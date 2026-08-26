@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Release build
+        run: cargo build --release --locked
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build image
+        run: docker build -t configgymajiggy:ci .
+
+      - name: Boot it and check the endpoints
+        run: |
+          docker run -d --name ci -p 8080:8080 configgymajiggy:ci
+          for _ in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' ci)" = healthy ] && break
+            sleep 1
+          done
+          test "$(docker inspect -f '{{.State.Health.Status}}' ci)" = healthy
+
+          # The healthcheck must not depend on an HTTP client in the image.
+          ! docker exec ci sh -c 'command -v curl' || (echo "curl leaked into the image" && exit 1)
+
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/ready)" = 200
+          PIN=$(curl -s -X POST localhost:8080/pin/ci | jq -r .pin)
+          curl -sf -X PUT "localhost:8080/pin/ci/$PIN" \
+            -H 'content-type: application/json' -d '{"ok":true}' >/dev/null
+          curl -s -X POST "localhost:8080/pin/ci/$PIN" | jq -e '.result.ok == true'
+
+          # Unknown pins are 404, not a freshly minted pin.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/pin/ci/ZZZZ)" = 404
+
+      - name: Stop
+        if: always()
+        run: docker rm -f ci || true

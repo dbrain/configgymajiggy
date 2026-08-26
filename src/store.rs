@@ -4,7 +4,9 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+use tokio::sync::Notify;
 
 /// The README documents this retry budget as a user-facing contract, so it is a
 /// named constant rather than a literal in a loop header.
@@ -31,6 +33,9 @@ struct PinItem {
     /// expire a live one.
     touched_at: Instant,
     result: Option<Payload>,
+    /// Woken when a payload lands, so a long poll returns immediately instead of
+    /// waiting out its timeout.
+    arrival: Arc<Notify>,
 }
 
 impl PinItem {
@@ -38,7 +43,43 @@ impl PinItem {
         Self {
             touched_at: Instant::now(),
             result: None,
+            arrival: Arc::new(Notify::new()),
         }
+    }
+}
+
+/// Per-namespace bookkeeping: the quota counter, and the failed-guess counter
+/// that rate limits enumeration. Held in a separate map from the pins so no
+/// code path ever holds a guard on both.
+#[derive(Debug)]
+struct NamespaceState {
+    live_pins: usize,
+    misses: u32,
+    window_started: Instant,
+}
+
+impl Default for NamespaceState {
+    fn default() -> Self {
+        Self {
+            live_pins: 0,
+            misses: 0,
+            window_started: Instant::now(),
+        }
+    }
+}
+
+impl NamespaceState {
+    /// Misses age out as a whole window rather than decaying individually, which
+    /// keeps the state to one counter and one timestamp.
+    fn roll_window(&mut self, window: std::time::Duration) {
+        if self.window_started.elapsed() >= window {
+            self.misses = 0;
+            self.window_started = Instant::now();
+        }
+    }
+
+    fn is_idle(&self, window: std::time::Duration) -> bool {
+        self.live_pins == 0 && self.window_started.elapsed() >= window
     }
 }
 
@@ -47,6 +88,7 @@ pub enum Poll {
     Delivered(Payload),
     Pending,
     Unknown,
+    Throttled,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,12 +96,16 @@ pub enum Deposit {
     Accepted,
     AlreadyPopulated,
     Unknown,
+    Throttled,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Allocation {
     Allocated(Pin),
-    Unavailable,
+    /// The service as a whole is full.
+    AtCapacity,
+    /// This namespace is at its own quota, so one tenant cannot starve the rest.
+    NamespaceFull,
 }
 
 /// Owns the map and every lock taken against it. Keeping all locking in one
@@ -67,15 +113,69 @@ pub enum Allocation {
 #[derive(Clone)]
 pub struct PinStore {
     pins: Arc<DashMap<PinKey, PinItem>>,
+    namespaces: Arc<DashMap<Namespace, NamespaceState>>,
     config: Arc<Config>,
+    started: Instant,
+    /// Millis-since-`started` of the last completed sweep, so readiness can tell
+    /// whether the cleanup task is still alive.
+    last_sweep_ms: Arc<AtomicU64>,
 }
 
 impl PinStore {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             pins: Arc::new(DashMap::new()),
+            namespaces: Arc::new(DashMap::new()),
             config,
+            started: Instant::now(),
+            last_sweep_ms: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// False once a sweep is overdue, which is what a dead cleanup task looks
+    /// like from the outside. Liveness stays up; only readiness drops.
+    pub fn is_ready(&self) -> bool {
+        let since_sweep = self
+            .elapsed_ms()
+            .saturating_sub(self.last_sweep_ms.load(Ordering::Relaxed));
+        u128::from(since_sweep) <= self.config.sweep_deadline().as_millis()
+    }
+
+    /// Records a miss and reports whether this namespace has now spent its
+    /// budget of wrong guesses.
+    ///
+    /// Only ever called once a lookup has already missed, so a caller holding a
+    /// real pin is never throttled - a guesser can burn the budget without
+    /// locking out the namespace's legitimate user.
+    fn record_miss(&self, namespace: &Namespace) -> bool {
+        // Fail closed if the bookkeeping table is full, so filling it cannot buy
+        // unthrottled guessing.
+        if self.namespaces.len() >= self.config.max_entries
+            && !self.namespaces.contains_key(namespace)
+        {
+            return true;
+        }
+
+        let mut state = self.namespaces.entry(namespace.clone()).or_default();
+        state.roll_window(self.config.probe_window);
+        state.misses = state.misses.saturating_add(1);
+        state.misses > self.config.max_probe_misses
+    }
+
+    fn release_pin(&self, namespace: &Namespace) {
+        if let Some(mut state) = self.namespaces.get_mut(namespace) {
+            state.live_pins = state.live_pins.saturating_sub(1);
+        }
+    }
+
+    /// The handle a long poll waits on. Cloned out so the caller never holds a
+    /// map guard across an await.
+    pub fn arrival(&self, key: &PinKey) -> Option<Arc<Notify>> {
+        self.pins.get(key).map(|item| Arc::clone(&item.arrival))
     }
 
     pub fn config(&self) -> &Config {
@@ -92,7 +192,17 @@ impl PinStore {
 
     pub fn allocate(&self, namespace: &Namespace) -> Allocation {
         if self.pins.len() >= self.config.max_entries {
-            return Allocation::Unavailable;
+            return Allocation::AtCapacity;
+        }
+
+        // Claim the quota slot first and drop the guard before touching `pins`,
+        // so the two maps are never locked at the same time.
+        {
+            let mut state = self.namespaces.entry(namespace.clone()).or_default();
+            if state.live_pins >= self.config.max_pins_per_namespace {
+                return Allocation::NamespaceFull;
+            }
+            state.live_pins += 1;
         }
 
         for _ in 0..ALLOCATION_ATTEMPTS {
@@ -104,7 +214,9 @@ impl PinStore {
                 return Allocation::Allocated(pin);
             }
         }
-        Allocation::Unavailable
+
+        self.release_pin(namespace);
+        Allocation::AtCapacity
     }
 
     /// Reads, refreshes and (on delivery) removes under a single shard write
@@ -124,33 +236,69 @@ impl PinStore {
             }
         });
 
+        // Guards are released by here, so touching the namespace map is safe.
+        match &outcome {
+            Poll::Delivered(_) => self.release_pin(&key.namespace),
+            Poll::Unknown if self.record_miss(&key.namespace) => return Poll::Throttled,
+            _ => {}
+        }
+
         outcome
     }
 
     pub fn deposit(&self, key: &PinKey, payload: Payload) -> Deposit {
-        match self.pins.get_mut(key) {
+        let outcome = match self.pins.get_mut(key) {
             None => Deposit::Unknown,
             Some(item) if item.result.is_some() => Deposit::AlreadyPopulated,
             Some(mut item) => {
                 item.result = Some(payload);
                 item.touched_at = Instant::now();
+                item.arrival.notify_waiters();
                 Deposit::Accepted
             }
+        };
+
+        if outcome == Deposit::Unknown && self.record_miss(&key.namespace) {
+            return Deposit::Throttled;
         }
+        outcome
     }
 
     /// Returns how many entries were evicted. Nothing but the freshness
     /// comparison happens inside the closure: `retain` holds a shard write lock
     /// while it runs, and logging there would block a runtime worker under it.
     pub fn sweep(&self) -> usize {
+        self.last_sweep_ms
+            .store(self.elapsed_ms(), Ordering::Relaxed);
+
         // Shorter uptime than the TTL means nothing can be stale yet.
         let Some(cutoff) = Instant::now().checked_sub(self.config.stale_age) else {
             return 0;
         };
 
-        let before = self.pins.len();
-        self.pins.retain(|_, item| item.touched_at > cutoff);
-        before - self.pins.len()
+        // Counting into a local map keeps the shard lock held for a comparison
+        // and an integer bump, nothing more.
+        let mut evicted: HashMap<Namespace, usize> = HashMap::new();
+        self.pins.retain(|key, item| {
+            let fresh = item.touched_at > cutoff;
+            if !fresh {
+                *evicted.entry(key.namespace.clone()).or_default() += 1;
+            }
+            fresh
+        });
+
+        let total = evicted.values().sum();
+        for (namespace, count) in evicted {
+            if let Some(mut state) = self.namespaces.get_mut(&namespace) {
+                state.live_pins = state.live_pins.saturating_sub(count);
+            }
+        }
+
+        // Namespace bookkeeping is itself unbounded unless idle entries go too.
+        let window = self.config.probe_window;
+        self.namespaces.retain(|_, state| !state.is_idle(window));
+
+        total
     }
 
     #[cfg(test)]
@@ -181,7 +329,7 @@ mod tests {
     fn allocated(store: &PinStore, ns: &Namespace) -> PinKey {
         match store.allocate(ns) {
             Allocation::Allocated(pin) => PinKey::new(ns.clone(), pin),
-            Allocation::Unavailable => panic!("allocation should succeed"),
+            other => panic!("allocation should succeed: {other:?}"),
         }
     }
 
@@ -208,7 +356,7 @@ mod tests {
         for _ in 0..3 {
             assert!(matches!(store.allocate(&ns), Allocation::Allocated(_)));
         }
-        assert_eq!(store.allocate(&ns), Allocation::Unavailable);
+        assert_eq!(store.allocate(&ns), Allocation::AtCapacity);
         assert_eq!(store.len(), 3);
     }
 
@@ -364,7 +512,7 @@ mod tests {
         for racer in racers {
             match racer.await.unwrap() {
                 Allocation::Allocated(pin) => pins.push(pin),
-                Allocation::Unavailable => panic!("capacity should not bind here"),
+                other => panic!("capacity should not bind here: {other:?}"),
             }
         }
 
@@ -399,6 +547,144 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn quota_is_returned_when_a_payload_is_delivered() {
+        let store = PinStore::new(Arc::new(Config {
+            max_pins_per_namespace: 2,
+            ..Config::default()
+        }));
+        let ns = namespace("quota");
+
+        let first = allocated(&store, &ns);
+        let second = allocated(&store, &ns);
+        assert_eq!(store.allocate(&ns), Allocation::NamespaceFull);
+
+        // Consuming a pin must hand its quota slot back, or a busy namespace
+        // slowly locks itself out.
+        store.deposit(&first, payload("x"));
+        assert!(matches!(store.poll(&first), Poll::Delivered(_)));
+        assert!(matches!(store.allocate(&ns), Allocation::Allocated(_)));
+
+        assert_eq!(store.poll(&second), Poll::Pending);
+    }
+
+    #[test]
+    fn quota_is_returned_when_pins_are_swept() {
+        let store = PinStore::new(Arc::new(Config {
+            max_pins_per_namespace: 2,
+            ..Config::default()
+        }));
+        let ns = namespace("swept-quota");
+
+        let first = allocated(&store, &ns);
+        let second = allocated(&store, &ns);
+        for key in [&first, &second] {
+            store.age(key, Config::default().stale_age + Duration::from_secs(1));
+        }
+
+        assert_eq!(store.sweep(), 2);
+        assert!(matches!(store.allocate(&ns), Allocation::Allocated(_)));
+        assert!(matches!(store.allocate(&ns), Allocation::Allocated(_)));
+        assert_eq!(store.allocate(&ns), Allocation::NamespaceFull);
+    }
+
+    #[test]
+    fn quotas_are_independent_across_namespaces() {
+        let store = PinStore::new(Arc::new(Config {
+            max_pins_per_namespace: 1,
+            ..Config::default()
+        }));
+
+        assert!(matches!(
+            store.allocate(&namespace("greedy")),
+            Allocation::Allocated(_)
+        ));
+        assert_eq!(
+            store.allocate(&namespace("greedy")),
+            Allocation::NamespaceFull
+        );
+        assert!(matches!(
+            store.allocate(&namespace("polite")),
+            Allocation::Allocated(_)
+        ));
+    }
+
+    #[test]
+    fn wrong_guesses_throttle_then_recover_after_the_window() {
+        let store = PinStore::new(Arc::new(Config {
+            max_probe_misses: 3,
+            probe_window: Duration::from_millis(80),
+            ..Config::default()
+        }));
+        let ns = namespace("guessy");
+        let key = PinKey::new(ns.clone(), Pin::parse("ZZZZ", 4).unwrap());
+
+        for _ in 0..3 {
+            assert_eq!(store.poll(&key), Poll::Unknown);
+        }
+        assert_eq!(store.poll(&key), Poll::Throttled);
+        assert_eq!(store.deposit(&key, payload("x")), Deposit::Throttled);
+        assert_eq!(store.len(), 0, "guessing must never allocate");
+
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(store.poll(&key), Poll::Unknown, "window should have rolled");
+    }
+
+    #[test]
+    fn throttling_never_blocks_a_caller_holding_a_real_pin() {
+        let store = PinStore::new(Arc::new(Config {
+            max_probe_misses: 1,
+            ..Config::default()
+        }));
+        let ns = namespace("mixed");
+        let real = allocated(&store, &ns);
+        let bogus = PinKey::new(ns, Pin::parse("ZZZZ", 4).unwrap());
+
+        assert_eq!(store.poll(&bogus), Poll::Unknown);
+        assert_eq!(store.poll(&bogus), Poll::Throttled);
+
+        // The throttle is only consulted once a lookup has already missed, so a
+        // guesser cannot lock the namespace's legitimate user out.
+        assert_eq!(store.poll(&real), Poll::Pending);
+        assert_eq!(store.deposit(&real, payload("x")), Deposit::Accepted);
+        assert!(matches!(store.poll(&real), Poll::Delivered(_)));
+    }
+
+    #[test]
+    fn readiness_tracks_the_sweeper() {
+        let store = PinStore::new(Arc::new(Config {
+            cleanup_interval: Duration::from_millis(10),
+            ..Config::default()
+        }));
+        assert!(store.is_ready());
+
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(!store.is_ready(), "an overdue sweep must fail readiness");
+
+        store.sweep();
+        assert!(store.is_ready(), "a completed sweep restores readiness");
+    }
+
+    #[test]
+    fn sweep_prunes_idle_namespace_bookkeeping() {
+        let store = PinStore::new(Arc::new(Config {
+            probe_window: Duration::from_millis(10),
+            ..Config::default()
+        }));
+        let key = PinKey::new(namespace("ghost"), Pin::parse("ZZZZ", 4).unwrap());
+
+        assert_eq!(store.poll(&key), Poll::Unknown);
+        assert_eq!(store.namespaces.len(), 1);
+
+        std::thread::sleep(Duration::from_millis(30));
+        store.sweep();
+        assert_eq!(
+            store.namespaces.len(),
+            0,
+            "idle namespace state must not accumulate"
+        );
     }
 
     #[test]
